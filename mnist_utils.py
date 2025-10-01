@@ -1147,6 +1147,28 @@ def get_seq_models(channels_cnn = [4,8,16,32,64],
             raise ValueError(f"Unknown model type in key {k}")
     return model_cfgs
 
+def get_seq_models_heavy(augs=[0,0.005,0.01,0.02,0.04,0.08,0.16,0.32,0.64,1,1.28]):
+    """SETUPS:
+        - Sweeping augs for heavy models
+    """
+    base_cnn = {"model": "models.CNNDeluxe", "epochs": 50, "model_args": {"base_channels": 32, "num_blocks": 3, "num_downsamples": 3}}
+    base_mlp = {"model": "models.MLPDeluxe", "epochs": 50, "model_args": {"width": 256, "num_layers": 8}}
+    model_cfgs = {}
+    for a in augs:
+        model_cfgs[f"CNN_aug{a}_H"] = {"data_aug": a}
+        model_cfgs[f"MLP_aug{a}_H"] = {"data_aug": a}
+    # merge with base configs
+    for k in model_cfgs:
+        if "CNN" in k:
+            model_cfgs[k]["model_args"] = {**base_cnn["model_args"], **model_cfgs[k].get("model_args", {})}
+            model_cfgs[k] = {**base_cnn, **model_cfgs[k]}
+        elif "MLP" in k:
+            model_cfgs[k]["model_args"] = {**base_mlp["model_args"], **model_cfgs[k].get("model_args", {})}
+            model_cfgs[k] = {**base_mlp, **model_cfgs[k]}
+        else:
+            raise ValueError(f"Unknown model type in key {k}")
+    return model_cfgs
+
 if __name__=="__main__":
 
     """
@@ -1277,3 +1299,14 @@ if __name__=="__main__":
             "AU2_EU": {"ignore_digits": [2, 3, 5], "ambiguous_vae_samples": True},
         }
         train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10)
+    elif args.setup==6:
+        print("Training a sequence of HEAVY models where only magnitude of augmentations is varied. AU2_EU is the unc setup")
+
+        model_setups = get_seq_models_heavy()
+        print(f"Total setups: {len(model_setups)}")
+        uncertainty_setups = {
+            "AU2_EU": {"ignore_digits": [2, 3, 5], "ambiguous_vae_samples": True},
+        }
+        train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10)
+    else:
+        print("Unknown setup:", args.setup)
