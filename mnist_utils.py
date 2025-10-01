@@ -17,6 +17,13 @@ import argparse
 from scipy.stats import spearmanr
 from sklearn.metrics import roc_curve, roc_auc_score
 
+
+ROOT_PATH = os.path.dirname(os.path.abspath(__file__))
+if ROOT_PATH=="/home/jloch/Desktop/diff/luzern/random_experiments/mnist":
+    DATA_PATH = "/home/jloch/Desktop/diff/luzern/values_datasets/mnist"
+else:
+    DATA_PATH = "/work3/jloch/MNIST/data"
+
 def get_tsne_probs(X, prob_map, x_vec, y_vec):
     """
     Bilinear-interpolate class probabilities from a (H,W,C) prob_map at t-SNE coords X (N,2).
@@ -136,7 +143,7 @@ def class_density_map(X, y, std_mult=0.05, max_sidelength=256, truncate=3, squar
 
     return prob_map, summed_density, x_vec, y_vec
 
-def get_dataloaders(root="/home/jloch/Desktop/diff/luzern/values_datasets/mnist",
+def get_dataloaders(root=DATA_PATH,
     batch_size=64, num_workers=0, shuffle_train=True, ignore_digits=[],
     augment=False, interpolation_factor=0.0, ambiguous_vae_samples=False
 ):
@@ -535,7 +542,7 @@ def model_from_cfg(m_cfg, as_func=False):
         return model()
 
 def train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10, 
-                    save_dir="/home/jloch/Desktop/diff/luzern/random_experiments/mnist/saves"):
+                    save_dir=os.path.join(ROOT_PATH, "saves")):
     """
     Train ensembles of models across uncertainty and model setups.
 
@@ -686,7 +693,7 @@ def uncertainty_stats_from_ckpts(model_list, m_cfg, resolution=256, tqdm_disable
                                  add_stats=False, is_EU=False, is_AU2=False):
     assert include_train or include_test, "At least one of include_train or include_test must be True"
     tab10_colors = plt.get_cmap('tab10').colors
-    save_dict = torch.load("/home/jloch/Desktop/diff/luzern/values_datasets/mnist/mnist_tsne.pth", weights_only=False)
+    save_dict = torch.load(os.path.join(DATA_PATH, "mnist_tsne.pth"), weights_only=False)
     (xvec0, xvec1), (yvec0, yvec1) = save_dict["x_vec"][[0,-1]], save_dict["y_vec"][[0,-1]]
     r = int(resolution)
     if not isinstance(model_list, (list, tuple)):
@@ -1204,7 +1211,7 @@ if __name__=="__main__":
 
         train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10)
     elif args.setup==2:
-        p = "/home/jloch/Desktop/diff/luzern/random_experiments/mnist/saves"
+        p = os.path.join(ROOT_PATH, "saves")
         print("Calculating uncertainty stats for ensembles in:")
         print(p)
         print("and adding to saved .pth files.")
