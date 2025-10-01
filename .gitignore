@@ -1,0 +1,9 @@
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+saves/
+Latent_Diffusion_MNIST_DDPM_using_Autoencoder.ipynb
+vae_epoch_25.pth
+diff_ae/
