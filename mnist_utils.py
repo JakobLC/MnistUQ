@@ -542,7 +542,8 @@ def model_from_cfg(m_cfg, as_func=False):
         return model()
 
 def train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10, 
-                    save_dir=os.path.join(ROOT_PATH, "saves")):
+                    save_dir=os.path.join(ROOT_PATH, "saves"),
+                    skip_existing=True):
     """
     Train ensembles of models across uncertainty and model setups.
 
@@ -564,7 +565,7 @@ def train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10,
         * au_factor currently only stored (no AU synthesis logic present in this file); kept for future extension.
         * Seeds: we vary torch.manual_seed, numpy, and random for reproducibility per model.
     """
-
+    print(f"Total setups: {len(model_setups)}")
     os.makedirs(save_dir, exist_ok=True)
 
     # Outer loop: uncertainty setups
@@ -572,7 +573,12 @@ def train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10,
         # Inner loop: model setups
         for m_key, m_cfg in model_setups.items():
             #model_name = m_cfg.get("model")
-
+            if skip_existing:
+                fname = f"{u_key}__{m_key}.pth"
+                fpath = os.path.join(save_dir, fname)
+                if os.path.isfile(fpath):
+                    print(f"Skipping existing file {fpath}")
+                    continue
             train_dl_aug, val_dl_aug = get_dataloaders(ignore_digits=u_cfg.get("ignore_digits", []), 
                                                         augment=m_cfg.get("data_aug", False),
                                                         ambiguous_vae_samples=u_cfg.get("ambiguous_vae_samples", 0))
@@ -1147,7 +1153,7 @@ def get_seq_models(channels_cnn = [4,8,16,32,64],
             raise ValueError(f"Unknown model type in key {k}")
     return model_cfgs
 
-def get_seq_models_heavy(augs=[0,0.005,0.01,0.02,0.04,0.08,0.16,0.32,0.64,1,1.28]):
+def get_seq_models_heavy(augs=[0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1]):
     """SETUPS:
         - Sweeping augs for heavy models
     """
@@ -1294,7 +1300,6 @@ if __name__=="__main__":
         print("Training a sequence of models where only magnitude of augmentations and network width is varied. AU2_EU is the unc setup")
 
         model_setups = get_seq_models()
-        print(f"Total setups: {len(model_setups)}")
         uncertainty_setups = {
             "AU2_EU": {"ignore_digits": [2, 3, 5], "ambiguous_vae_samples": True},
         }
@@ -1303,10 +1308,25 @@ if __name__=="__main__":
         print("Training a sequence of HEAVY models where only magnitude of augmentations is varied. AU2_EU is the unc setup")
 
         model_setups = get_seq_models_heavy()
-        print(f"Total setups: {len(model_setups)}")
         uncertainty_setups = {
             "AU2_EU": {"ignore_digits": [2, 3, 5], "ambiguous_vae_samples": True},
         }
+        train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10)
+    elif args.setup==7:
+        model_setups = get_seq_models_heavy(augs=[0.1,0.2,0.3])
+        uncertainty_setups = {"AU2_EU": {"ignore_digits": [2, 3, 5], "ambiguous_vae_samples": True},}
+        train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10)
+    elif args.setup==8:
+        model_setups = get_seq_models_heavy(augs=[0.4,0.5,0.6])
+        uncertainty_setups = {"AU2_EU": {"ignore_digits": [2, 3, 5], "ambiguous_vae_samples": True},}
+        train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10)
+    elif args.setup==9:
+        model_setups = get_seq_models_heavy(augs=[0.7,0.8,0.9])
+        uncertainty_setups = {"AU2_EU": {"ignore_digits": [2, 3, 5], "ambiguous_vae_samples": True},}
+        train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10)
+    elif args.setup==10:
+        model_setups = get_seq_models_heavy(augs=[1])
+        uncertainty_setups = {"AU2_EU": {"ignore_digits": [2, 3, 5], "ambiguous_vae_samples": True},}
         train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10)
     else:
         print("Unknown setup:", args.setup)
