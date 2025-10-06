@@ -215,6 +215,9 @@ class MNISTWithTSNE(Dataset):
         self.base = datasets.MNIST(root=root, train=train, transform=transform,
                                    target_transform=None, download=download)
         assert len(tsne_array) == len(self.base.data), "t-SNE array length must match MNIST split"
+
+        self.orig_tsne = torch.as_tensor(tsne_array.copy())
+
         if normalize_tsne:
             mu,std = tsne_array.mean(axis=0), tsne_array.std(axis=0)
             std = np.maximum(std, 1e-8)
@@ -240,10 +243,16 @@ class MNISTWithTSNE(Dataset):
             self.base.data = torch.cat([self.base.data, interp_images], dim=0)
             top_gt = torch.where(vae_dict["ratio_A"] > vae_dict["ratio_B"], vae_dict["gt_A"], vae_dict["gt_B"])
             self.base.targets = torch.cat([self.base.targets, top_gt], dim=0)
+
             tsne_A = self.tsne[vae_dict["indices_A"]]
             tsne_B = self.tsne[vae_dict["indices_B"]]
             tsne_interp = tsne_A * vae_dict["ratio_A"][:,None] + tsne_B * vae_dict["ratio_B"][:,None]
             self.tsne = torch.cat([self.tsne, tsne_interp], dim=0)
+
+            orig_tsne_A = self.orig_tsne[vae_dict["indices_A"]]
+            orig_tsne_B = self.orig_tsne[vae_dict["indices_B"]]
+            orig_tsne_interp = orig_tsne_A * vae_dict["ratio_A"][:,None] + orig_tsne_B * vae_dict["ratio_B"][:,None]
+            self.orig_tsne = torch.cat([self.orig_tsne, orig_tsne_interp], dim=0)
 
         if ignore_digits:
             mask = self.probs[:, ignore_digits].sum(dim=1) < 1e-8
@@ -277,7 +286,7 @@ def dict2str(d):
 def train(
     model, train_dl, val_dl, epochs=20, lr=1e-4, weight_decay=0.0,
     device=None, val_every_steps=500, kl_scale=0.0, n_vali_samples=1000, fixed_vali_samples=False,
-    tqdm_disable=False, cosine_anneal_epochs=20, au_factor=0.0, soft_labels=False
+    tqdm_disable=False, cosine_anneal_epochs=20, soft_labels=False, save_every_epochs=0,
 ):
     """
     Basic training loop with BCEWithLogitsLoss + Adam.
@@ -291,7 +300,8 @@ def train(
     history = {
         "train_loss": [], "train_acc": [],
         "val_loss": [], "val_acc": [],
-        "steps": 0, "val_every_steps": val_every_steps
+        "steps": 0, "val_every_steps": val_every_steps,
+        "model_epochs": {}
     }
     if cosine_anneal_epochs and cosine_anneal_epochs > 0:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cosine_anneal_epochs * len(train_dl))
@@ -311,7 +321,6 @@ def train(
     val_loss, val_acc = float('nan'), float('nan')
     for epoch in range(1, epochs + 1):
         model.train()
-
         for xb_image, xb_tsne, yb_probs in train_dl:
             if not tqdm_disable:
                 
@@ -392,6 +401,12 @@ def train(
                 history["val_acc"].append(val_acc)
                 
                 model.train()  # back to train mode
+        if save_every_epochs and save_every_epochs > 0 and (epoch % save_every_epochs == 0):
+            state_dict_detached = {
+                k: v.detach().cpu().clone()
+                for k, v in model.state_dict().items()
+            }
+            history["model_epochs"][epoch] = state_dict_detached
     return history
 
 def get_interp_probs(yb,yb_probs,au_factor):
@@ -457,8 +472,8 @@ def voronoi_raster(points, values, xlim, ylim, size, supersample=4):
     x_vec : (W,) array            x coords of pixel centers
     y_vec : (H,) array            y coords of pixel centers (bottom→top)
     """
-    assert points.ndim == 2 and points.shape[1] == 2
-    assert values.ndim in (1, 2) and values.shape[0] == points.shape[0]
+    assert points.ndim == 2 and points.shape[1] == 2, f"points must be (N,2) but got {points.shape}"
+    assert values.ndim in (1, 2) and values.shape[0] == points.shape[0], f"expected values to be (N,) or (N,C) but got {values.shape} for {points.shape[0]} points"
     points = np.asarray(points, dtype=np.float64)
     values = np.asarray(values)
     H, W   = map(int, size)
@@ -543,7 +558,7 @@ def model_from_cfg(m_cfg, as_func=False):
 
 def train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10, 
                     save_dir=os.path.join(ROOT_PATH, "saves"),
-                    skip_existing=True):
+                    skip_existing=True, smart_epochs=False):
     """
     Train ensembles of models across uncertainty and model setups.
 
@@ -564,9 +579,17 @@ def train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10,
         * If a model_setup provides "tsne": True we pass tsne flag when constructing model.
         * au_factor currently only stored (no AU synthesis logic present in this file); kept for future extension.
         * Seeds: we vary torch.manual_seed, numpy, and random for reproducibility per model.
+
+    smart_epochs:
+        if model setups include multiple items which only differ by "epochs",
+        we can save time by training the model for the maximum number of epochs
+        and then extracting the intermediate checkpoints for the smaller epoch counts.
     """
     print(f"Total setups: {len(model_setups)}")
     os.makedirs(save_dir, exist_ok=True)
+
+    if smart_epochs:
+        raise NotImplementedError("smart_epochs not implemented yet")
 
     # Outer loop: uncertainty setups
     for u_key, u_cfg in uncertainty_setups.items():
@@ -611,7 +634,6 @@ def train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10,
                     fixed_vali_samples   = m_cfg.get("fixed_vali_samples", False),
                     tqdm_disable         = m_cfg.get("tqdm_disable", False),
                     cosine_anneal_epochs = m_cfg.get("cosine_anneal_epochs", m_cfg.get("epochs", 20)),
-                    au_factor = u_cfg.get("au_factor", 0.0),
                     soft_labels = u_cfg.get("soft_labels", False)
                 )
 
@@ -695,8 +717,13 @@ def idx_to_mask(idx, total_length):
         mask[idx] = True
     return mask
 
-def uncertainty_stats_from_ckpts(model_list, m_cfg, resolution=256, tqdm_disable=False, include_test=True, include_train=True, T=1.0,
-                                 add_stats=False, is_EU=False, is_AU2=False):
+def uncertainty_stats_from_ckpts(data, resolution=256, tqdm_disable=False, include_test=True, include_train=True, T=1.0,
+                                 add_stats=False):
+    m_cfg = data["model_setup"]
+    model_list = [ckpt for ckpt in data["checkpoints"]]
+    is_EU=(data["uncertainty_setup"].get("ignore_digits", []) == [2, 3, 5]),
+    is_AU2=data["uncertainty_setup"].get("ambiguous_vae_samples", False)
+
     assert include_train or include_test, "At least one of include_train or include_test must be True"
     tab10_colors = plt.get_cmap('tab10').colors
     save_dict = torch.load(os.path.join(DATA_PATH, "mnist_tsne.pth"), weights_only=False)
@@ -713,7 +740,7 @@ def uncertainty_stats_from_ckpts(model_list, m_cfg, resolution=256, tqdm_disable
     train_dl, val_dl = get_dataloaders(augment=False, shuffle_train=False, ambiguous_vae_samples=True)
 
     if include_train and include_test:
-        tsne = torch.cat([train_dl.dataset.tsne, val_dl.dataset.tsne], dim=0)
+        tsne = torch.cat([train_dl.dataset.orig_tsne, val_dl.dataset.orig_tsne], dim=0)
         gts = torch.cat([save_dict["train_labels"], save_dict["test_labels"]], dim=0)
         probs_gts = torch.cat([train_dl.dataset.probs, val_dl.dataset.probs], dim=0)
         vae_idx_train = torch.arange(len(save_dict["train_labels"]), len(train_dl.dataset.probs)).tolist()
@@ -721,12 +748,12 @@ def uncertainty_stats_from_ckpts(model_list, m_cfg, resolution=256, tqdm_disable
         vae_idx = vae_idx_train + (len(vae_idx_train)+vae_idx_val).tolist()
         vae_mask = idx_to_mask(vae_idx, len(probs_gts))
     elif include_test:
-        tsne = val_dl.dataset.tsne
+        tsne = val_dl.dataset.orig_tsne
         gts = save_dict["test_labels"]
         probs_gts = val_dl.dataset.probs
         vae_mask = idx_to_mask(slice(len(gts),None), len(val_dl.dataset.probs))
     elif include_train:
-        tsne = train_dl.dataset.tsne
+        tsne = train_dl.dataset.orig_tsne
         gts = save_dict["train_labels"]
         probs_gts = train_dl.dataset.probs
         vae_mask = idx_to_mask(slice(len(gts),None), len(train_dl.dataset.probs))
@@ -767,6 +794,15 @@ def uncertainty_stats_from_ckpts(model_list, m_cfg, resolution=256, tqdm_disable
         bar.close()
     all_model_probs = torch.stack(all_model_probs, axis=0)
     all_model_logits = torch.stack(all_model_logits, axis=0)
+
+
+    if is_EU:
+        #mask = ~torch.isin(out_dict["eval"]["gts"], torch.tensor([2,3,5]))
+        # based on probs instead. IID is where GT probs for 2,3,5 sum to near zero
+        iid_mask = probs_gts[:,[2,3,5]].sum(1)< 1e-8
+    else:
+        iid_mask = None
+
     out_dict["extent"] = (xvec0, xvec1, yvec0, yvec1)
     out_dict["voronoi_entropies"] = torch.as_tensor(np.stack(voronoi_entropies, axis=0))
     out_dict["voronoi_rgbs"] = torch.as_tensor(np.stack(voronoi_rgbs, axis=0))
@@ -774,20 +810,15 @@ def uncertainty_stats_from_ckpts(model_list, m_cfg, resolution=256, tqdm_disable
     out_dict["mean_rgb"] = out_dict["voronoi_rgbs"].mean(0).clamp(0.0, 1.0)
     out_dict["unc"] = calculate_uncertainty(torch.as_tensor(out_dict["voronoi_probs"], dtype=torch.float32))
     out_dict["eval"] = {"probs": all_model_probs, "tsne": tsne, "preds": all_model_probs.argmax(axis=2), 
-                        "gts": gts, "probs_gts": probs_gts, "vae_mask": vae_mask,
+                        "gts": gts, "probs_gts": probs_gts, 
                         "unc": calculate_uncertainty(torch.as_tensor(all_model_probs, dtype=torch.float32).permute(0,2,1)),
-                        "logits": all_model_logits
+                        "logits": all_model_logits, "is_AU2": is_AU2, "is_EU": is_EU,
+                        "iid_mask": iid_mask, "vae_mask": vae_mask,
                         }
     if add_stats:
-        if is_EU:
-            #mask = ~torch.isin(out_dict["eval"]["gts"], torch.tensor([2,3,5]))
-            # based on probs instead
-            mask = out_dict["eval"]["probs_gts"][:,[2,3,5]].sum(1)< 1e-8
-        else:
-            mask = None
-        out_dict["ood_stats"] = ood_stats(out_dict, do_plot=False, is_ood=mask)
-        out_dict["calib_stats"] = calib_stats(out_dict, mask=mask, vae_mask=vae_mask, is_AU2=is_AU2)
-        out_dict["amb_stats"] = ambiguity_stats(out_dict, mask=mask, vae_mask=vae_mask)
+        out_dict["ood_stats"] = ood_stats(out_dict, do_plot=False)#, is_ood=mask)
+        out_dict["calib_stats"] = calib_stats(out_dict, is_AU2=is_AU2)#, mask=mask, vae_mask=vae_mask)
+        out_dict["amb_stats"] = ambiguity_stats(out_dict)#, mask=mask, vae_mask=vae_mask)
     return out_dict
 
 
@@ -814,14 +845,16 @@ def plot_voronoi(out_dict, colorbar=False, title="", cmap="viridis", vmax=1.0, p
               out_dict["unc"]["aleatoric_uncertainty"].cpu().numpy(),
               out_dict["unc"]["epistemic_uncertainty"].cpu().numpy()]
     extent = out_dict["extent"]
+    points = out_dict["eval"]["tsne"].numpy()
     if plot_digits:
         centers = []
         for i in range(10):
-            mask = (out_dict["eval"]["gts"] == i)
-            if torch.sum(mask) > 0:
-                pts = out_dict["eval"]["points"][mask]
-                center = pts.mean(axis=0)
-                centers.append((i, center))
+            #weight = out_dict["eval"]["probs_gts"][:,i].numpy()
+            weight = (out_dict["eval"]["probs_gts"][:,i].numpy()==1).astype(float)
+            print(weight.sum())
+            pts = (points*weight[:,None])/weight.sum()
+            center = pts.sum(axis=0)
+            centers.append((i, center))
 
     plt.figure(figsize=(16,5))
     for i in range(4):
@@ -879,18 +912,23 @@ def ece(probs, labels, n_bins=20, equal_bin_weight=False, return_bins=False):
         else:
             return sum([e * s for e, s in zip(ece, bin_sizes)]) / (sum(bin_sizes)+1e-12)
 
-def calib_stats(out_dict,mask=None,vae_mask=None, do_plot=False, is_AU2=False):
+def calib_stats(out_dict,iid_mask=None,vae_mask=None, do_plot=False, is_AU2=None):
     """Computes ECE with no temperature scaling, ECE with optimal temperature scaling, 
     for both NLL and ECE optimal temperatures.
     """
-    if (mask is None) and (vae_mask is None):
+    if is_AU2 is None:
+        assert "is_AU2" in out_dict["eval"], "Must provide is_AU2 flag if not present in out_dict"
+        is_AU2 = out_dict["eval"]["is_AU2"]
+    vae_mask = out_dict["eval"].get("vae_mask", vae_mask)
+    iid_mask = out_dict["eval"].get("iid_mask", iid_mask)
+    if (iid_mask is None) and (vae_mask is None):
         joint_mask = slice(None)
-    elif (mask is None):
+    elif (iid_mask is None):
         joint_mask = torch.logical_not(vae_mask)
     elif (vae_mask is None):
-        joint_mask = mask
+        joint_mask = iid_mask
     else:
-        joint_mask = torch.logical_and(mask, torch.logical_not(vae_mask))
+        joint_mask = torch.logical_and(iid_mask, torch.logical_not(vae_mask))
     gts = out_dict["eval"]["probs_gts"].numpy()[joint_mask].argmax(1)
     Ts = []
     probs_optece = 0
@@ -919,10 +957,10 @@ def calib_stats(out_dict,mask=None,vae_mask=None, do_plot=False, is_AU2=False):
 
     if is_AU2:
         #use vae samples
-        if mask is None:
+        if iid_mask is None:
             eval_mask = slice(None)
         else:
-            eval_mask = mask
+            eval_mask = iid_mask
     else:
         eval_mask = joint_mask
 
@@ -1018,9 +1056,11 @@ def ambiguity_stats(out_dict, do_plot=False, mask=None, vae_mask=None):
     """Computes spearmanr for a range of uncertainty measures given probabilistic ground truths.
     """
     if mask is None:
-        mask = slice(None)
+        assert "iid_mask" in out_dict["eval"], "If mask is not provided, out_dict must contain 'iid_mask'"
+        mask = out_dict["eval"]["iid_mask"]
     if vae_mask is None:
-        raise ValueError("vae_mask must be provided to ambiguity_stats")
+        assert "vae_mask" in out_dict["eval"], "If vae_mask is not provided, out_dict must contain 'vae_mask'"
+        vae_mask = out_dict["eval"]["vae_mask"]
     probs_gts = out_dict["eval"]["probs_gts"].numpy()[mask]
     entropy_gt = -np.sum(probs_gts * np.log(probs_gts + 1e-12), axis=1)
     is_high_entropy = np.quantile(entropy_gt, 0.9) < entropy_gt
@@ -1074,9 +1114,12 @@ def ood_stats(out_dict, do_plot=True, is_ood=None):
     """Computes AUROC for detecting OOD samples (2,3,5) given uncertainty measures.
     """
     if is_ood is None:
-        is_ood = out_dict["eval"]["probs_gts"][:,[2,3,5]].sum(1) >= 1e-8
+        assert "iid_mask" in out_dict["eval"], "If is_ood is not provided, out_dict must contain 'iid_mask'"
+        is_ood = ~out_dict["eval"]["iid_mask"].numpy()
     stats_dict = {}
     n = len(out_dict["eval"]["unc"])
+
+    if do_plot: plt.figure(figsize=(5*n,4))
 
     for i,(k,v) in enumerate(out_dict["eval"]["unc"].items()):
         if do_plot: plt.subplot(1,n,i+1)
@@ -1153,7 +1196,7 @@ def get_seq_models(channels_cnn = [4,8,16,32,64],
             raise ValueError(f"Unknown model type in key {k}")
     return model_cfgs
 
-def get_seq_models_heavy(augs=[0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1]):
+def get_aug_models_heavy(augs=[0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1]):
     """SETUPS:
         - Sweeping augs for heavy models
     """
@@ -1174,6 +1217,114 @@ def get_seq_models_heavy(augs=[0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1]):
         else:
             raise ValueError(f"Unknown model type in key {k}")
     return model_cfgs
+
+def get_epochs_models_heavy(epochs=[10,20,30,40,50,60,70,80,90,100]):
+    """SETUPS:
+        - Sweeping epochs for heavy models
+    """
+    base_cnn = {"model": "models.CNNDeluxe", "epochs": 50, "model_args": {"base_channels": 32, "num_blocks": 3, "num_downsamples": 3}}
+    base_mlp = {"model": "models.MLPDeluxe", "epochs": 50, "model_args": {"width": 256, "num_layers": 8}}
+    model_cfgs = {}
+    for e in epochs:
+        model_cfgs[f"CNN_e{e}_H_aug0"] = {"epochs": e}
+        model_cfgs[f"MLP_e{e}_H_aug0"] = {"epochs": e}
+        model_cfgs[f"CNN_e{e}_H_aug1"] = {"epochs": e, "data_aug": 1}
+        model_cfgs[f"MLP_e{e}_H_aug1"] = {"epochs": e, "data_aug": 1}
+    # merge with base configs
+    for k in model_cfgs:
+        if "CNN" in k:
+            model_cfgs[k]["model_args"] = {**base_cnn["model_args"], **model_cfgs[k].get("model_args", {})}
+            model_cfgs[k] = {**base_cnn, **model_cfgs[k]}
+        elif "MLP" in k:
+            model_cfgs[k]["model_args"] = {**base_mlp["model_args"], **model_cfgs[k].get("model_args", {})}
+            model_cfgs[k] = {**base_mlp, **model_cfgs[k]}
+        else:
+            raise ValueError(f"Unknown model type in key {k}")
+    return model_cfgs
+
+def get_heavy_weight_decay_models(epochs=50, weight_decays=[0, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1]):
+    """SETUPS:
+        - Sweeping weight decay for heavy models
+    """
+    base_cnn = {"model": "models.CNNDeluxe", "epochs": epochs, "model_args": {"base_channels": 32, "num_blocks": 3, "num_downsamples": 3}}
+    base_mlp = {"model": "models.MLPDeluxe", "epochs": epochs, "model_args": {"width": 256, "num_layers": 8}}
+    model_cfgs = {}
+    for wd in weight_decays:
+        model_cfgs[f"CNN_wd{wd}_H_aug0"] = {"weight_decay": wd}
+        model_cfgs[f"MLP_wd{wd}_H_aug0"] = {"weight_decay": wd}
+        model_cfgs[f"CNN_wd{wd}_H_aug1"] = {"weight_decay": wd, "data_aug": 1}
+        model_cfgs[f"MLP_wd{wd}_H_aug1"] = {"weight_decay": wd, "data_aug": 1}
+    # merge with base configs
+    for k in model_cfgs:
+        if "CNN" in k:
+            model_cfgs[k]["model_args"] = {**base_cnn["model_args"], **model_cfgs[k].get("model_args", {})}
+            model_cfgs[k] = {**base_cnn, **model_cfgs[k]}
+        elif "MLP" in k:
+            model_cfgs[k]["model_args"] = {**base_mlp["model_args"], **model_cfgs[k].get("model_args", {})}
+            model_cfgs[k] = {**base_mlp, **model_cfgs[k]}
+        else:
+            raise ValueError(f"Unknown model type in key {k}")
+    return model_cfgs
+
+seq_types = {"channels_aug": "[MODEL]_c[CHANNELS]_aug1",
+             "channels": "[MODEL]_c[CHANNELS]_aug0",
+             "depth_aug": "[MODEL]_d[DEPTH]_aug1",
+             "depth": "[MODEL]_d[DEPTH]_aug0",
+             "aug": "[MODEL]_aug[AUG]",
+             "epochs": "[MODEL]_e[EPOCHS]",
+             "aug_H": "[MODEL]_aug[AUG]_H"}
+
+seq_types_match = {"channels_aug": lambda name: name.split("_")[1].startswith("c") and name.endswith("_aug1"),
+                    "channels": lambda name: name.split("_")[1].startswith("c") and name.endswith("_aug0"),
+                    "depth_aug": lambda name: name.split("_")[1].startswith("d") and name.endswith("_aug1"),
+                    "depth": lambda name: name.split("_")[1].startswith("d") and name.endswith("_aug0"),
+                    "aug": lambda name: name.split("_")[1].startswith("aug") and not name.endswith("_H"),
+                    "epochs": lambda name: name.split("_")[1].startswith("e"),
+                    "aug_H": lambda name: name.split("_")[1].startswith("aug") and name.endswith("_H"),}
+
+model_types = ["CNN", "MLP"]
+identifiers = {"d": ("depth",int), "c": ("channels",int), "aug": ("aug",float), "e": ("epochs",int)}
+identifiers_inv = {v[0]: (k,v[1]) for k,v in identifiers.items()}
+flags = {"H": "heavy"}
+flags_inv = {"heavy": "H"}
+
+def seq_type_from_name(name):
+    """Returns the sequence type from the model name,
+    in addition to all the key-value pairs found in the name.
+    """
+    split_name = name.split("_")
+    params = {}
+    params["model_type"] = split_name[0]
+    assert params["model_type"] in model_types, f"Unknown model type {params['model_type']} in {name}"
+    for i,value in enumerate(split_name[1:]):
+
+        #find identifier in value
+        match = 0
+        for idf, (idf_full, idf_type) in identifiers.items():
+            if value.startswith(idf):
+                params[idf_full] = idf_type(value[len(idf):])
+                match = 1
+                if i==0:
+                    params["varying_param"] = idf_full
+                break
+        if match:
+            continue
+        #find flag in value
+        for flag, flag_str in flags.items():
+            if value == flag:
+                params[flag_str] = True
+                match = 1
+                break
+        if match:
+            continue
+        raise ValueError(f"Unknown identifier in {value} of {name}. Should start with one of {list(identifiers.keys())} or be one of {list(flags.keys())}")
+    #match to a seq_type. 
+    for seq_type, match_fn in seq_types_match.items():
+        if match_fn(name):
+            params["seq_type"] = seq_type
+            break
+    assert "seq_type" in params, f"Could not match sequence type for {name}"
+    return params
 
 if __name__=="__main__":
 
@@ -1199,6 +1350,8 @@ if __name__=="__main__":
     """
     argparser = argparse.ArgumentParser()
     argparser.add_argument("--setup", type=int, default=0)
+    argparser.add_argument("--augs", type=str, default="")
+    argparser.add_argument("--epochs", type=str, default="")
     args = argparser.parse_args()
     
     if args.setup==0:
@@ -1244,20 +1397,24 @@ if __name__=="__main__":
         print(p)
         print("and adding to saved .pth files.")
         filelist = os.listdir(p)
+        print(f"Found {len(filelist)} files.")
+        filelist2 = []
+        print("Filtering for .pth files without unc_stats...")
+        for f in filelist:
+            if f.endswith(".pth"):
+                data = torch.load(os.path.join(p, f), weights_only=False)
+                if "unc_stats" not in data:
+                    filelist2.append(f)
+        filelist = filelist2
+        print(f"{len(filelist)} files need processing.")
         bar = tqdm(filelist, desc="Processing models")
         for filename in filelist:
             bar.set_description(f"Processing {filename}")
             data = torch.load(os.path.join(p, filename), weights_only=False)
-            if "unc_stats" in data:
-                bar.update(1)
-                continue
-            unc_dict = uncertainty_stats_from_ckpts(data["checkpoints"], 
-                                                    m_cfg=data["model_setup"],
+            unc_dict = uncertainty_stats_from_ckpts(data,
                                                     include_train=False, 
                                                     add_stats=True, 
-                                                    tqdm_disable=True,
-                                                    is_EU = (data["uncertainty_setup"].get("ignore_digits", []) == [2,3,5]),
-                                                    is_AU2 = "AU2" in filename
+                                                    tqdm_disable=True
                                                     )
             data["unc_stats"] = unc_dict
             torch.save(data, os.path.join(p, filename))
@@ -1281,7 +1438,7 @@ if __name__=="__main__":
             "underfitted_MLP": {"model": "mlp1"},
             "well_fitted_tsne_MLP": {"model": "MLP1", "tsne": True},
         }
-        train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10)
+        train_ensembles(model_setups, uncertainty_setups)
     elif args.setup==4:
         print("Training ensembles for soft label setups and ambiguous VAE samples.")
         uncertainty_setups = {
@@ -1295,7 +1452,7 @@ if __name__=="__main__":
             "uberfitted_CNN": {"model": "CNN3", "epochs": 50},
             "uberfitted_MLP": {"model": "MLP3", "epochs": 50},
         }
-        train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10)
+        train_ensembles(model_setups, uncertainty_setups)
     elif args.setup==5:
         print("Training a sequence of models where only magnitude of augmentations and network width is varied. AU2_EU is the unc setup")
 
@@ -1303,30 +1460,44 @@ if __name__=="__main__":
         uncertainty_setups = {
             "AU2_EU": {"ignore_digits": [2, 3, 5], "ambiguous_vae_samples": True},
         }
-        train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10)
+        train_ensembles(model_setups, uncertainty_setups)
     elif args.setup==6:
         print("Training a sequence of HEAVY models where only magnitude of augmentations is varied. AU2_EU is the unc setup")
 
-        model_setups = get_seq_models_heavy()
+        model_setups = get_aug_models_heavy()
         uncertainty_setups = {
             "AU2_EU": {"ignore_digits": [2, 3, 5], "ambiguous_vae_samples": True},
         }
-        train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10)
+        train_ensembles(model_setups, uncertainty_setups)
     elif args.setup==7:
-        model_setups = get_seq_models_heavy(augs=[0.1,0.2,0.3])
+        print("Training a sequence of HEAVY models where only magnitude of augmentations is varied. AU2_EU is the unc setup")
+        assert len(args.augs)>0, "Please provide --augs argument as a comma-separated list of floats, e.g. --augs 0,0.1,0.2"
+        augs = [float(a) for a in args.augs.split(",")]
+        model_setups = get_aug_models_heavy(augs=augs)
         uncertainty_setups = {"AU2_EU": {"ignore_digits": [2, 3, 5], "ambiguous_vae_samples": True},}
-        train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10)
+        train_ensembles(model_setups, uncertainty_setups)
     elif args.setup==8:
-        model_setups = get_seq_models_heavy(augs=[0.4,0.5,0.6])
-        uncertainty_setups = {"AU2_EU": {"ignore_digits": [2, 3, 5], "ambiguous_vae_samples": True},}
-        train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10)
+        print("Training a sequence of HEAVY models where only number of epochs and network width is varied. AU2_EU is the unc setup")
+        assert len(args.epochs)>0, "Please provide --epochs argument as a comma-separated list of integers, e.g. --epochs 10,20,30"
+        epochs = [int(e) for e in args.epochs.split(",")]
+        model_setups = get_epochs_models_heavy(epochs=epochs)
+        uncertainty_setups = {
+            "AU2_EU": {"ignore_digits": [2, 3, 5], "ambiguous_vae_samples": True},
+        }
+        train_ensembles(model_setups, uncertainty_setups)
     elif args.setup==9:
-        model_setups = get_seq_models_heavy(augs=[0.7,0.8,0.9])
-        uncertainty_setups = {"AU2_EU": {"ignore_digits": [2, 3, 5], "ambiguous_vae_samples": True},}
-        train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10)
+        print("Training a sequence of HEAVY models where only magnitude of augmentations is varied. EU is the unc setup")
+        assert len(args.augs)>0, "Please provide --augs argument as a comma-separated list of floats, e.g. --augs 0,0.1,0.2"
+        augs = [float(a) for a in args.augs.split(",")]
+        model_setups = get_aug_models_heavy(augs=augs)
+        uncertainty_setups = {"EU": {"ignore_digits": [2, 3, 5], "ambiguous_vae_samples": False},}
+        train_ensembles(model_setups, uncertainty_setups)
     elif args.setup==10:
-        model_setups = get_seq_models_heavy(augs=[1])
-        uncertainty_setups = {"AU2_EU": {"ignore_digits": [2, 3, 5], "ambiguous_vae_samples": True},}
-        train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10)
+        print("Training a sequence of HEAVY models where only weight decay and network width is varied. AU2_EU is the unc setup")
+        model_setups = get_heavy_weight_decay_models()
+        uncertainty_setups = {
+            "AU2_EU": {"ignore_digits": [2, 3, 5], "ambiguous_vae_samples": True},
+        }
+        train_ensembles(model_setups, uncertainty_setups)
     else:
         print("Unknown setup:", args.setup)
