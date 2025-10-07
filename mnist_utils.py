@@ -144,7 +144,7 @@ def class_density_map(X, y, std_mult=0.05, max_sidelength=256, truncate=3, squar
     return prob_map, summed_density, x_vec, y_vec
 
 def get_dataloaders(root=DATA_PATH,
-    batch_size=64, num_workers=0, shuffle_train=True, ignore_digits=[],
+    batch_size=64, num_workers=8, shuffle_train=True, ignore_digits=[],
     augment=False, interpolation_factor=0.0, ambiguous_vae_samples=False
 ):
     """
