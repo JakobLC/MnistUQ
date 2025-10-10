@@ -16,7 +16,7 @@ from models import (get_models_dict,
 import argparse
 from scipy.stats import spearmanr
 from sklearn.metrics import roc_curve, roc_auc_score
-
+from sklearn.calibration import _sigmoid_calibration
 
 ROOT_PATH = os.path.dirname(os.path.abspath(__file__))
 if ROOT_PATH=="/home/jloch/Desktop/diff/luzern/random_experiments/mnist":
@@ -143,8 +143,390 @@ def class_density_map(X, y, std_mult=0.05, max_sidelength=256, truncate=3, squar
 
     return prob_map, summed_density, x_vec, y_vec
 
+def _per_point_sigma_same_class(X, y, neighbour_std=10, tqdm_disable=False):
+    """
+    For each point i, compute sigma_i as the std of the distances to the
+    'neighbour_std' nearest NEIGHBORS OF THE SAME CLASS (excluding itself).
+    Returns sigma_world of shape (N,).
+    """
+    N = X.shape[0]
+    sigma_world = np.zeros(N, dtype=np.float64)
+    eps = 1e-12
+
+    # Prefer fast kNN backends if available
+    backend = None
+    NearestNeighbors = None
+    KDTree = None
+    try:
+        from sklearn.neighbors import NearestNeighbors as _NN
+        NearestNeighbors = _NN
+        backend = "sklearn"
+    except Exception:
+        try:
+            from scipy.spatial import cKDTree as _KD
+            KDTree = _KD
+            backend = "ckdtree"
+        except Exception:
+            backend = "brute"
+
+    classes = np.unique(y)
+    loop_var = classes
+    if not tqdm_disable:
+        loop_var = tqdm(loop_var, desc="kNN (same class)", ncols=80, leave=False)
+
+    for c in loop_var:
+        idx = np.where(y == c)[0]
+        if idx.size <= 1:
+            sigma_world[idx] = 1.0  # arbitrary fallback if class has 0/1 samples
+            continue
+
+        Xc = X[idx]
+        k = min(neighbour_std, Xc.shape[0]-1)
+
+        if backend == "sklearn":
+            nn = NearestNeighbors(n_neighbors=k+1, algorithm="auto", metric="euclidean")
+            nn.fit(Xc)
+            dists, _ = nn.kneighbors(Xc, return_distance=True)  # includes self at col 0
+            # take neighbors 1..k
+            d_k = dists[:, 1:k+1]
+        elif backend == "ckdtree":
+            tree = KDTree(Xc)
+            d_k, _ = tree.query(Xc, k=k+1)  # includes self at col 0
+            if k == 1:
+                # shape (n,) when k=1; make it 2D
+                d_k = np.atleast_2d(d_k).T
+            d_k = d_k[:, 1:k+1]
+        else:  # brute force (O(n^2) for this class)
+            # Compute pairwise distances within class
+            # Use chunking if memory is a concern; here we keep it simple
+            D = np.sqrt(((Xc[:, None, :] - Xc[None, :, :])**2).sum(axis=2))
+            # set self-distance to +inf so argpartition ignores self for nearest neighbors
+            np.fill_diagonal(D, np.inf)
+            # pick k smallest per row via argpartition
+            part_idx = np.argpartition(D, kth=k-1, axis=1)[:, :k]
+            # gather distances and compute std row-wise
+            rows = np.arange(Xc.shape[0])[:, None]
+            d_k = D[rows, part_idx]
+
+        sigmas_c = d_k.std(axis=1)
+        # Guard against zeros (identical points) or numerical issues
+        sigmas_c = np.maximum(sigmas_c, eps)
+
+        sigma_world[idx] = sigmas_c
+
+    return sigma_world
+
+from sklearn.neighbors import NearestNeighbors
+
+def knn_classification_metrics(out_dict, k=10, num_classes=None, metric="euclidean"):
+    """
+    Leave-one-out KNN on the full dataset.
+
+    Parameters
+    ----------
+    X : (N, D) array-like
+    y : (N,) int array-like, labels in [0..C-1]
+    k : int, number of neighbors (excluding self)
+    num_classes : int or None (auto -> max(y)+1)
+    metric : str, currently only 'euclidean' is supported
+
+    Returns
+    -------
+    results : dict with keys
+        'per_class_acc_majority' : (C,) float array
+        'per_class_acc_soft'     : (C,) float array
+        'weighted_acc_majority'  : float
+        'weighted_acc_soft'      : float
+        'support'                : (C,) int array (class counts)
+    """
+    iid_mask = out_dict["eval"]["iid_mask"]
+    vae_mask = out_dict["eval"]["vae_mask"]
+    AU = out_dict["eval"]["unc"]["AU"].numpy()
+    EU = out_dict["eval"]["unc"]["EU"].numpy()
+    masks = [np.where(~vae_mask & iid_mask)[0],
+                np.where(~vae_mask & ~iid_mask)[0],
+                np.where(vae_mask & iid_mask)[0],
+                np.where(vae_mask & ~iid_mask)[0]]
+
+    x = [np.log10(AU[mask]) for mask in masks]
+    y = [np.log10(EU[mask]) for mask in masks]
+    X = np.stack([np.concatenate(x,axis=0),np.concatenate(y,axis=0)],axis=1)
+    y = np.array(sum([[i for _ in range(len(xi))] for i,xi in enumerate(x)],[]))
+    N = X.shape[0]
+    if N == 0:
+        raise ValueError("Empty dataset.")
+    if metric != "euclidean":
+        raise ValueError("Only Euclidean distance supported in this implementation.")
+
+    if num_classes is None:
+        num_classes = int(y.max()) + 1
+
+    k = int(k)
+    if k < 1:
+        raise ValueError("k must be >= 1")
+    if k >= N:
+        raise ValueError("k must be less than the number of samples (leave-one-out requires k < N).")
+
+    nn = NearestNeighbors(n_neighbors=k+1, algorithm="auto", metric="euclidean")
+    nn.fit(X)
+    dists, idxs = nn.kneighbors(X, return_distance=True)
+    # drop self (the first neighbor should be itself; if duplicates exist, still okay to drop col 0)
+    idxs = idxs[:, 1:k+1]
+    # --- Gather neighbor labels ---
+    neigh_labels = y[idxs]  # (N, k)
+
+    # --- Counts per class in each neighborhood ---
+    # We'll use np.bincount row-wise.
+    counts = np.zeros((N, num_classes), dtype=np.int32)
+    for c in range(num_classes):
+        counts[:, c] = (neigh_labels == c).sum(axis=1)
+
+    # Majority-vote prediction (ties → lowest class id)
+    maj_pred = counts.argmax(axis=1)
+
+    # Correctness indicators
+    correct_majority = (maj_pred == y).astype(np.float64)
+
+    # Soft accuracy (probability of picking the correct class at random from the
+    # neighbor class-frequency distribution): p = count(true_class)/k
+    true_counts = counts[np.arange(N), y]
+    soft_acc = true_counts / float(k)
+
+    # --- Per-class accuracies ---
+    support = np.bincount(y, minlength=num_classes)
+    per_class_acc_majority = np.zeros(num_classes, dtype=np.float64)
+    per_class_acc_soft = np.zeros(num_classes, dtype=np.float64)
+
+    for c in range(num_classes):
+        mask = (y == c)
+        n_c = support[c]
+        if n_c > 0:
+            per_class_acc_majority[c] = correct_majority[mask].mean()
+            per_class_acc_soft[c] = soft_acc[mask].mean()
+        else:
+            per_class_acc_majority[c] = np.nan  # no samples of this class
+            per_class_acc_soft[c] = np.nan
+
+    # --- Weighted overall accuracies (weights = class supports) ---
+    total = support.sum()
+    # Only include classes with support > 0
+    nonzero = support > 0
+    weighted_acc_majority = float((support[nonzero] * per_class_acc_majority[nonzero]).sum() / total)
+    weighted_acc_soft = float((support[nonzero] * per_class_acc_soft[nonzero]).sum() / total)
+
+    return {
+        "per_class_acc_majority": per_class_acc_majority,
+        "per_class_acc_soft": per_class_acc_soft,
+        "weighted_acc_majority": weighted_acc_majority,
+        "weighted_acc_soft": weighted_acc_soft,
+        "support": support,
+    }
+
+def class_hist2d_map(X, y, x_vec, y_vec, num_classes=10):
+    """
+    Simple 2D histogram density estimator aligned with x_vec, y_vec.
+    The bins are centered on x_vec, y_vec (consistent with class_density_map).
+    
+    Parameters
+    ----------
+    X : (N, 2)
+        Data coordinates.
+    y : (N,)
+        Integer class labels in [0 .. num_classes-1].
+    x_vec, y_vec : (S,), (S,)
+        Grid coordinates (bin centers) in each dimension.
+    num_classes : int
+        Number of distinct classes.
+
+    Returns
+    -------
+    prob_map : (S, S, num_classes)
+        Normalized class probabilities per pixel.
+    summed_density : (S, S)
+        Total count per pixel.
+    density : (S, S, num_classes)
+        Raw class counts.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y, dtype=np.int64)
+    Sx, Sy = len(x_vec), len(y_vec)
+
+    # Compute bin edges from centers (assume uniform spacing)
+    if len(x_vec) < 2 or len(y_vec) < 2:
+        raise ValueError("x_vec and y_vec must have length >= 2 to define bin edges")
+
+    dx = x_vec[1] - x_vec[0]
+    dy = y_vec[1] - y_vec[0]
+    x_edges = np.concatenate(([x_vec[0] - dx/2], x_vec + dx/2))
+    y_edges = np.concatenate(([y_vec[0] - dy/2], y_vec + dy/2))
+
+    # Initialize outputs
+    density = np.zeros((Sy, Sx, num_classes), dtype=np.float64)
+
+    # Count per class
+    for c in range(num_classes):
+        mask = (y == c)
+        if not np.any(mask):
+            continue
+        H, _, _ = np.histogram2d(
+            X[mask, 1], X[mask, 0],
+            bins=[y_edges, x_edges]
+        )
+        density[:, :, c] = H
+
+    # Total and normalized maps
+    summed_density = density.sum(axis=2)
+    prob_map = density / np.clip(summed_density[..., None], 1e-12, None)
+
+    return prob_map, summed_density, density
+
+
+def class_density_map2(
+    X, y,
+    neighbour_std=10,
+    std_mult=3,
+    pad_rel=0.10,
+    max_sidelength=256,
+    truncate=3,
+    square=True,
+    tqdm_disable=False,
+    num_classes=10
+):
+    """
+    X: (N,2) t-SNE coordinates
+    y: (N,) integer labels in [0..9]
+    neighbour_std: int, number of same-class neighbors used to compute per-point sigma
+    pad_rel: float, relative padding of the data span. pad_rel=0.1 -> add 5% of span to each side
+    max_sidelength: int, grid size (SxS)
+    truncate: float, kernel radius in multiples of sigma (used for efficiency window)
+    square: bool, if True, expand to square bounds
+    tqdm_disable: bool, disable progress bars
+
+    Returns:
+        prob_map (S,S,10),
+        summed_density (S,S),
+        x_vec (S,),
+        y_vec (S,)
+    """
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y, dtype=np.int64)
+    S = int(max_sidelength)
+
+    if X.ndim != 2 or X.shape[1] != 2:
+        raise ValueError("X must be of shape (N, 2)")
+
+    N = X.shape[0]
+    if N == 0:
+        # empty input: return degenerate maps
+        prob_map = np.zeros((S, S, num_classes), dtype=np.float64)
+        summed_density = np.zeros((S, S), dtype=np.float64)
+        x_vec = np.linspace(0, 1, S)
+        y_vec = np.linspace(0, 1, S)
+        return prob_map, summed_density, x_vec, y_vec
+
+    # --- per-point bandwidth (world units) from same-class neighbor std ---
+    sigma_world = _per_point_sigma_same_class(
+        X, y, neighbour_std=neighbour_std, tqdm_disable=tqdm_disable
+    )
+    sigma_world *= float(std_mult)
+
+    # --- bounds with RELATIVE padding ---
+    xmin, xmax = X[:, 0].min(), X[:, 0].max()
+    ymin, ymax = X[:, 1].min(), X[:, 1].max()
+    span_x = xmax - xmin
+    span_y = ymax - ymin
+    if span_x <= 0: span_x = 1e-8
+    if span_y <= 0: span_y = 1e-8
+
+    # Interpret pad_rel as TOTAL padding fraction; split equally per side (5% each side if pad_rel=0.1)
+    padx_each = 0.5 * pad_rel * span_x
+    pady_each = 0.5 * pad_rel * span_y
+    xmin_p, xmax_p = xmin - padx_each, xmax + padx_each
+    ymin_p, ymax_p = ymin - pady_each, ymax + pady_each
+
+    # --- optional square bounds by expanding the smaller span ---
+    if square:
+        span_xp = xmax_p - xmin_p
+        span_yp = ymax_p - ymin_p
+        if span_xp <= 0: span_xp = 1e-8
+        if span_yp <= 0: span_yp = 1e-8
+        if span_xp > span_yp:
+            extra = 0.5 * (span_xp - span_yp)
+            ymin_p -= extra
+            ymax_p += extra
+        elif span_yp > span_xp:
+            extra = 0.5 * (span_yp - span_xp)
+            xmin_p -= extra
+            xmax_p += extra
+
+    # --- grid vectors (data-space coordinates per pixel center) ---
+    x_vec = np.linspace(xmin_p, xmax_p, S)
+    y_vec = np.linspace(ymin_p, ymax_p, S)
+
+    # pixel size in data units
+    dx = (xmax_p - xmin_p) / (S - 1) if S > 1 else 1.0
+    dy = (ymax_p - ymin_p) / (S - 1) if S > 1 else 1.0
+    if dx <= 0: dx = 1e-8
+    if dy <= 0: dy = 1e-8
+
+    density = np.zeros((S, S, num_classes), dtype=np.float64)
+
+    # --- map data coords to fractional pixel coords ---
+    fx = (X[:, 0] - xmin_p) / dx  # 0..S-1 (fractional)
+    fy = (X[:, 1] - ymin_p) / dy
+
+    loop_var = range(N)
+    if not tqdm_disable:
+        loop_var = tqdm(loop_var, desc="Building density map", ncols=80, leave=False)
+
+    eps = 1e-12
+    for i in loop_var:
+        c = int(y[i])
+        if c < 0 or c >= num_classes:
+            continue
+
+        # per-point sigma (isotropic in world units)
+        sig_w = max(float(sigma_world[i]), eps)
+        sigma_x_pix = max(sig_w / dx, eps)
+        sigma_y_pix = max(sig_w / dy, eps)
+
+        rx = int(np.ceil(truncate * sigma_x_pix))
+        ry = int(np.ceil(truncate * sigma_y_pix))
+        if rx < 1 and ry < 1:
+            rx = ry = 1  # ensure at least a single pixel support
+
+        cx = fx[i]
+        cy = fy[i]
+
+        # window bounds (inclusive) with clipping
+        x0 = max(0, int(np.floor(cx - rx)))
+        x1 = min(S - 1, int(np.ceil(cx + rx)))
+        y0 = max(0, int(np.floor(cy - ry)))
+        y1 = min(S - 1, int(np.ceil(cy + ry)))
+        if x1 < x0 or y1 < y0:
+            continue
+
+        xs = np.arange(x0, x1 + 1)
+        ys = np.arange(y0, y1 + 1)
+
+        # subpixel distances in pixel units (separable Gaussian)
+        dxp = (xs - cx) / sigma_x_pix
+        dyp = (ys - cy) / sigma_y_pix
+        gx = np.exp(-0.5 * (dxp ** 2))
+        gy = np.exp(-0.5 * (dyp ** 2))
+        kernel = np.outer(gy, gx)  # (len(ys), len(xs))
+        kernel /= kernel.sum()  # normalize per-point kernel to sum to 1
+
+        density[y0:y1 + 1, x0:x1 + 1, c] += kernel
+
+    summed_density = density.sum(axis=2)
+    prob_map = density / np.clip(summed_density[..., None], 1e-12, None)
+
+    return prob_map, density, summed_density, x_vec, y_vec
+
+
 def get_dataloaders(root=DATA_PATH,
-    batch_size=64, num_workers=8, shuffle_train=True, ignore_digits=[],
+    batch_size=64, num_workers=4, shuffle_train=True, ignore_digits=[],
     augment=False, interpolation_factor=0.0, ambiguous_vae_samples=False
 ):
     """
@@ -286,7 +668,8 @@ def dict2str(d):
 def train(
     model, train_dl, val_dl, epochs=20, lr=1e-4, weight_decay=0.0,
     device=None, val_every_steps=500, kl_scale=0.0, n_vali_samples=1000, fixed_vali_samples=False,
-    tqdm_disable=False, cosine_anneal_epochs=20, soft_labels=False, save_every_epochs=0,
+    tqdm_disable=False, cosine_anneal_epochs=20, soft_labels=False, ckpt_every_epochs=0,
+    also_save_ema_ckpts=False, epoch_ema_memory=1
 ):
     """
     Basic training loop with BCEWithLogitsLoss + Adam.
@@ -294,6 +677,13 @@ def train(
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
+    if also_save_ema_ckpts:
+        ema_state_dict = {}
+        for k in model.state_dict().keys():
+            ema_state_dict[k] = model.state_dict()[k].detach().cpu().clone()
+        memory = len(train_dl)*epoch_ema_memory
+        ema_lambda = (memory - 1) / memory
+        print(f"ema_lambda: {ema_lambda:.6f}")
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
@@ -301,7 +691,8 @@ def train(
         "train_loss": [], "train_acc": [],
         "val_loss": [], "val_acc": [],
         "steps": 0, "val_every_steps": val_every_steps,
-        "model_epochs": {}
+        "ckpt_epochs": {},
+        "ema_ckpt_epochs": {},
     }
     if cosine_anneal_epochs and cosine_anneal_epochs > 0:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cosine_anneal_epochs * len(train_dl))
@@ -356,6 +747,11 @@ def train(
             train_loss = loss.item()
             history["train_loss"].append(train_loss)
             history["train_acc"].append(train_acc.item())
+
+            if also_save_ema_ckpts:
+                # EMA update with decay 0.99
+                for k, v in model.state_dict().items():
+                    ema_state_dict[k] = ema_lambda * ema_state_dict[k] + (1-ema_lambda) * v.detach().cpu()
             
             # --- Perform validation every val_every_steps ---
             if val_every_steps is not None and (history["steps"] % val_every_steps == 0):
@@ -401,12 +797,13 @@ def train(
                 history["val_acc"].append(val_acc)
                 
                 model.train()  # back to train mode
-        if save_every_epochs and save_every_epochs > 0 and (epoch % save_every_epochs == 0):
-            state_dict_detached = {
-                k: v.detach().cpu().clone()
-                for k, v in model.state_dict().items()
-            }
-            history["model_epochs"][epoch] = state_dict_detached
+        if ckpt_every_epochs and ckpt_every_epochs > 0 and (epoch % ckpt_every_epochs == 0):
+            state_dict_detached = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            history["ckpt_epochs"][epoch] = state_dict_detached
+            if also_save_ema_ckpts:
+                ema_state_dict_clone = {k: v.clone() for k, v in ema_state_dict.items()}
+                history["ema_ckpt_epochs"][epoch] = ema_state_dict_clone
+
     return history
 
 def get_interp_probs(yb,yb_probs,au_factor):
@@ -558,7 +955,7 @@ def model_from_cfg(m_cfg, as_func=False):
 
 def train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10, 
                     save_dir=os.path.join(ROOT_PATH, "saves"),
-                    skip_existing=True, smart_epochs=False):
+                    skip_existing=True):
     """
     Train ensembles of models across uncertainty and model setups.
 
@@ -579,17 +976,10 @@ def train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10,
         * If a model_setup provides "tsne": True we pass tsne flag when constructing model.
         * au_factor currently only stored (no AU synthesis logic present in this file); kept for future extension.
         * Seeds: we vary torch.manual_seed, numpy, and random for reproducibility per model.
-
-    smart_epochs:
-        if model setups include multiple items which only differ by "epochs",
-        we can save time by training the model for the maximum number of epochs
-        and then extracting the intermediate checkpoints for the smaller epoch counts.
     """
     print(f"Total setups: {len(model_setups)}")
     os.makedirs(save_dir, exist_ok=True)
 
-    if smart_epochs:
-        raise NotImplementedError("smart_epochs not implemented yet")
 
     # Outer loop: uncertainty setups
     for u_key, u_cfg in uncertainty_setups.items():
@@ -694,18 +1084,11 @@ def calculate_uncertainty(softmax_preds: torch.Tensor):
         expected_entropy[pred] = entropy
     expected_entropy = torch.mean(expected_entropy, dim=0)
     mutual_information = pred_entropy - expected_entropy
-    return {"pred_entropy": pred_entropy,
-            "aleatoric_uncertainty": expected_entropy,
-            "epistemic_uncertainty": mutual_information}
-
-def model_func_from_ensemble_dict(ensemble_dict):
-    raise ValueError("Deprecated, use model_from_cfg instead.")
-    model_setup = ensemble_dict["model_setup"]
-    model_name = model_setup.get("model")
-    tsne_flag = model_setup.get("tsne", False)
-    def model_func():
-        return get_models_dict(tsne=tsne_flag, channel_mult=model_setup.get("channel_mult", 1))[model_name]()
-    return model_func
+    negative_mask = mutual_information < 0
+    mutual_information[negative_mask] = mutual_information[~negative_mask].min()
+    return {"TU": pred_entropy,
+            "AU": expected_entropy,
+            "EU": mutual_information}
 
 def idx_to_mask(idx, total_length):
     mask = torch.zeros(total_length, dtype=torch.bool)
@@ -718,7 +1101,7 @@ def idx_to_mask(idx, total_length):
     return mask
 
 def uncertainty_stats_from_ckpts(data, resolution=256, tqdm_disable=False, include_test=True, include_train=True, T=1.0,
-                                 add_stats=False):
+                                 add_stats=False, add_knn_sep=True):
     m_cfg = data["model_setup"]
     model_list = [ckpt for ckpt in data["checkpoints"]]
     is_EU=(data["uncertainty_setup"].get("ignore_digits", []) == [2, 3, 5]),
@@ -815,9 +1198,12 @@ def uncertainty_stats_from_ckpts(data, resolution=256, tqdm_disable=False, inclu
                         "logits": all_model_logits, "is_AU2": is_AU2, "is_EU": is_EU,
                         "iid_mask": iid_mask, "vae_mask": vae_mask,
                         }
+    if add_knn_sep:
+        out_dict["knn_sep"] = knn_classification_metrics(out_dict)
+        out_dict["knn_sep"]["mask"] = ["No Unc", "EU", "AU", "AU+EU"]
     if add_stats:
         out_dict["ood_stats"] = ood_stats(out_dict, do_plot=False)#, is_ood=mask)
-        out_dict["calib_stats"] = calib_stats(out_dict, is_AU2=is_AU2)#, mask=mask, vae_mask=vae_mask)
+        out_dict["calib_stats"] = calib_stats_values(out_dict, is_AU2=is_AU2)
         out_dict["amb_stats"] = ambiguity_stats(out_dict)#, mask=mask, vae_mask=vae_mask)
     return out_dict
 
@@ -841,9 +1227,9 @@ def auroc(unc_score, is_ood, do_plot=False):
 def plot_voronoi(out_dict, colorbar=False, title="", cmap="viridis", vmax=1.0, plot_digits=True):
     titles = [title, "TU", "AU", "EU"]
     images = [out_dict["mean_rgb"].cpu().numpy(),
-              out_dict["unc"]["pred_entropy"].cpu().numpy(),
-              out_dict["unc"]["aleatoric_uncertainty"].cpu().numpy(),
-              out_dict["unc"]["epistemic_uncertainty"].cpu().numpy()]
+              out_dict["unc"]["TU"].cpu().numpy(),
+              out_dict["unc"]["AU"].cpu().numpy(),
+              out_dict["unc"]["EU"].cpu().numpy()]
     extent = out_dict["extent"]
     points = out_dict["eval"]["tsne"].numpy()
     if plot_digits:
@@ -911,6 +1297,195 @@ def ece(probs, labels, n_bins=20, equal_bin_weight=False, return_bins=False):
             return sum(ece)/len(ece)
         else:
             return sum([e * s for e, s in zip(ece, bin_sizes)]) / (sum(bin_sizes)+1e-12)
+
+
+def _fit_platt_scaling_binary(scores, labels):
+    pos = np.count_nonzero(labels > 0.5)
+    neg = np.count_nonzero(labels <= 0.5)
+    if pos == 0 or neg == 0:
+        p = np.clip(labels.mean(), 1e-4, 1 - 1e-4)
+        return 0.0, float(np.log((1 - p) / p))
+    return _sigmoid_calibration(scores, labels)
+
+
+def _fit_platt_scaling_weighted(scores, fractional_correct):
+    eps = 1e-12
+    pos_mask = fractional_correct > eps
+    neg_mask = (1.0 - fractional_correct) > eps
+
+    if not np.any(pos_mask) or not np.any(neg_mask):
+        p = np.clip(fractional_correct.mean(), 1e-4, 1 - 1e-4)
+        return 0.0, float(np.log((1 - p) / p))
+
+    y_true = np.concatenate([np.ones(pos_mask.sum()), np.zeros(neg_mask.sum())])
+    expanded_scores = np.concatenate([scores[pos_mask], scores[neg_mask]])
+    weights = np.concatenate([fractional_correct[pos_mask], (1.0 - fractional_correct[neg_mask])])
+
+    return _sigmoid_calibration(expanded_scores, y_true, sample_weight=weights)
+
+
+def _fit_platt_scaling(uncertainties, correct):
+    uncertainties = np.asarray(uncertainties, dtype=np.float64).reshape(-1)
+    correct = np.asarray(correct, dtype=np.float64).reshape(-1)
+    finite_mask = np.isfinite(uncertainties) & np.isfinite(correct)
+    if not np.any(finite_mask):
+        return 0.0, 0.0
+    uncertainties = uncertainties[finite_mask]
+    correct = correct[finite_mask]
+
+    scores = -uncertainties
+    eps = 1e-12
+    if np.all((correct <= eps) | (correct >= 1 - eps)):
+        labels = (correct >= 0.5).astype(float)
+        return _fit_platt_scaling_binary(scores, labels)
+    else:
+        return _fit_platt_scaling_weighted(scores, correct)
+
+
+def _apply_platt_scaling(uncertainties, a, b):
+    scores = -np.asarray(uncertainties, dtype=np.float64).reshape(-1)
+    logits = scores * a + b
+    logits = np.clip(logits, -60.0, 60.0)
+    confidences = 1.0 / (1.0 + np.exp(logits))
+    return confidences
+
+
+def _calibration_bins(confidences, correct, n_bins=20):
+    confidences = np.asarray(confidences, dtype=np.float64).reshape(-1)
+    correct = np.asarray(correct, dtype=np.float64).reshape(-1)
+    bins = np.linspace(0.0, 1.0 + 1e-8, n_bins + 1)
+    binids = np.digitize(confidences, bins) - 1
+    binids = np.clip(binids, 0, n_bins - 1)
+    bin_total = np.bincount(binids, minlength=n_bins)
+    sum_conf = np.bincount(binids, weights=confidences, minlength=n_bins)
+    sum_correct = np.bincount(binids, weights=correct, minlength=n_bins)
+    nonzero = bin_total > 0
+    bin_conf = np.zeros_like(sum_conf)
+    bin_acc = np.zeros_like(sum_correct)
+    bin_conf[nonzero] = sum_conf[nonzero] / bin_total[nonzero]
+    bin_acc[nonzero] = sum_correct[nonzero] / bin_total[nonzero]
+    discrepancies = np.abs(bin_acc - bin_conf)
+    num_nonzero = int(np.count_nonzero(nonzero))
+    if num_nonzero == 0:
+        ace = 0.0
+    else:
+        ace = float(discrepancies[nonzero].mean())
+    total = bin_total.sum()
+    if total == 0:
+        ece_val = 0.0
+    else:
+        weights = bin_total / total
+        ece_val = float(np.dot(discrepancies, weights))
+    return ace, ece_val, {
+        "bin_conf": bin_conf,
+        "bin_acc": bin_acc,
+        "bin_counts": bin_total,
+        "num_nonzero": num_nonzero,
+    }
+
+
+def calib_stats_values(
+    out_dict,
+    iid_mask=None,
+    vae_mask=None,
+    is_AU2=None,
+    n_bins=20,
+    use_monte_carlo=False,
+    mc_samples=20,
+    random_state=None,
+    do_plot=False,
+):
+    if is_AU2 is None:
+        assert "is_AU2" in out_dict["eval"], "Must provide is_AU2 flag if not present in out_dict"
+        is_AU2 = out_dict["eval"]["is_AU2"]
+    vae_mask = out_dict["eval"].get("vae_mask", vae_mask)
+    iid_mask = out_dict["eval"].get("iid_mask", iid_mask)
+    mc_samples = int(mc_samples)
+    if mc_samples <= 0:
+        mc_samples = 1
+    if (iid_mask is None) and (vae_mask is None):
+        joint_mask = slice(None)
+    elif iid_mask is None:
+        joint_mask = torch.logical_not(vae_mask)
+    elif vae_mask is None:
+        joint_mask = iid_mask
+    else:
+        joint_mask = torch.logical_and(iid_mask, torch.logical_not(vae_mask))
+
+    if is_AU2:
+        eval_mask = iid_mask if iid_mask is not None else slice(None)
+    else:
+        eval_mask = joint_mask
+
+    probs_gts = out_dict["eval"]["probs_gts"].to(torch.float32)
+    ensemble_probs = out_dict["eval"]["probs"].to(torch.float32).mean(dim=0)
+
+    probs_gts_eval = probs_gts[eval_mask]
+    ensemble_probs_eval = ensemble_probs[eval_mask]
+    pred_labels = ensemble_probs_eval.argmax(dim=1)
+
+    idx = torch.arange(probs_gts_eval.shape[0], device=probs_gts_eval.device)
+    fractional_correct = probs_gts_eval[idx, pred_labels]
+
+    if use_monte_carlo:
+        generator = torch.Generator(device=probs_gts_eval.device)
+        if random_state is not None:
+            generator.manual_seed(int(random_state))
+        sampled_labels = torch.multinomial(
+            probs_gts_eval,
+            num_samples=int(mc_samples),
+            replacement=True,
+            generator=generator,
+        )
+        correct_mc = (sampled_labels == pred_labels.unsqueeze(1)).to(torch.float32)
+        correct_values = correct_mc.reshape(-1).cpu().numpy()
+        effective_samples = correct_values.size
+    else:
+        correct_values = fractional_correct.cpu().numpy()
+        effective_samples = correct_values.size
+
+    stats = {}
+    if do_plot:
+        plt.figure(figsize=(12, 4))
+
+    for k, (metric_name, unc_tensor) in enumerate(out_dict["eval"]["unc"].items()):
+        unc_eval = unc_tensor[eval_mask]
+        unc_eval_np = np.asarray(unc_eval, dtype=np.float64).reshape(-1)
+        if use_monte_carlo:
+            unc_fit = np.repeat(unc_eval_np, int(mc_samples))
+        else:
+            unc_fit = unc_eval_np
+
+        a, b = _fit_platt_scaling(unc_fit, correct_values)
+        confidences = _apply_platt_scaling(unc_fit, a, b)
+        ace_val, ece_val, bin_dict = _calibration_bins(confidences, correct_values, n_bins=n_bins)
+
+        stats[metric_name] = {
+            "ace": float(ace_val),
+            "ece": float(ece_val),
+            "a": a,
+            "b": b
+        }
+        if do_plot:
+            plt.subplot(1, 3, k + 1)
+            delta = 1/40
+            y_steps = np.repeat(bin_dict["bin_acc"], 3)
+            x_steps = sum([[i1,i2,float("nan")] for (i1,i2) in zip(bin_dict["bin_conf"]-delta,bin_dict["bin_conf"]+delta)],[])
+            y_steps_ideal = sum([[i,i,float("nan")] for i in bin_dict["bin_conf"]],[])
+
+
+            ratio_use = 1
+            randperm = np.random.permutation(len(confidences))
+            idx = randperm[:int(ratio_use*len(confidences))]
+
+            plt.plot(confidences[idx], correct_values[idx], 'o', alpha=0.1)
+            plt.plot(x_steps, y_steps, 'r-', linewidth=3)
+            plt.plot(x_steps, y_steps_ideal, 'k-', linewidth=2)
+            plt.xlabel("Mapped uncertainty")
+            plt.ylabel("GT prob on predicted class")
+            plt.title(f"{metric_name}\nECE={ece_val:.4f}, ACE={ace_val:.4f}")
+
+    return stats
 
 def calib_stats(out_dict,iid_mask=None,vae_mask=None, do_plot=False, is_AU2=None):
     """Computes ECE with no temperature scaling, ECE with optimal temperature scaling, 
@@ -1073,6 +1648,7 @@ def ambiguity_stats(out_dict, do_plot=False, mask=None, vae_mask=None):
         amb_stats[k] = {"spearman_all": spearman_all,
                        "spearman_high": spearman_high,
                        "spearman_low": spearman_low,
+                       "ncc_all": np.corrcoef(unc2, entropy_gt)[0,1],
                        "mean_entropies": {"gt": entropy_gt.mean(),
                                          "all": unc2.mean(),
                                          "high": unc2[is_high_entropy].mean(),
@@ -1272,18 +1848,27 @@ seq_types = {"channels_aug": "[MODEL]_c[CHANNELS]_aug1",
              "depth": "[MODEL]_d[DEPTH]_aug0",
              "aug": "[MODEL]_aug[AUG]",
              "epochs": "[MODEL]_e[EPOCHS]",
-             "aug_H": "[MODEL]_aug[AUG]_H"}
+             "aug_H": "[MODEL]_aug[AUG]_H",
+             "wd_H": "[MODEL]_wd[WEIGHT_DECAY]_H_aug0",
+             "wd_H_aug": "[MODEL]_wd[WEIGHT_DECAY]_H_aug1",
+             "epochs_H": "[MODEL]_e[EPOCHS]_H_aug0",
+             "epochs_H_aug": "[MODEL]_e[EPOCHS]_H_aug1",}
 
 seq_types_match = {"channels_aug": lambda name: name.split("_")[1].startswith("c") and name.endswith("_aug1"),
                     "channels": lambda name: name.split("_")[1].startswith("c") and name.endswith("_aug0"),
                     "depth_aug": lambda name: name.split("_")[1].startswith("d") and name.endswith("_aug1"),
                     "depth": lambda name: name.split("_")[1].startswith("d") and name.endswith("_aug0"),
                     "aug": lambda name: name.split("_")[1].startswith("aug") and not name.endswith("_H"),
-                    "epochs": lambda name: name.split("_")[1].startswith("e"),
-                    "aug_H": lambda name: name.split("_")[1].startswith("aug") and name.endswith("_H"),}
+                    "epochs": lambda name: name.split("_")[1].startswith("e") and "_H" not in name,
+                    "aug_H": lambda name: name.split("_")[1].startswith("aug") and name.endswith("_H"),
+                    "wd_H": lambda name: name.split("_")[1].startswith("wd") and "_H" in name and name.endswith("_aug0"),
+                    "wd_H_aug": lambda name: name.split("_")[1].startswith("wd") and "_H" in name and name.endswith("_aug1"),
+                    "epochs_H": lambda name: name.split("_")[1].startswith("e") and name.endswith("_H_aug0"),
+                    "epochs_H_aug": lambda name: name.split("_")[1].startswith("e") and name.endswith("_H_aug1"),
+                    }
 
 model_types = ["CNN", "MLP"]
-identifiers = {"d": ("depth",int), "c": ("channels",int), "aug": ("aug",float), "e": ("epochs",int)}
+identifiers = {"d": ("depth",int), "c": ("channels",int), "aug": ("aug",float), "e": ("epochs",int), "wd": ("weight_decay",float)}
 identifiers_inv = {v[0]: (k,v[1]) for k,v in identifiers.items()}
 flags = {"H": "heavy"}
 flags_inv = {"heavy": "H"}
@@ -1402,8 +1987,11 @@ if __name__=="__main__":
         print("Filtering for .pth files without unc_stats...")
         for f in filelist:
             if f.endswith(".pth"):
-                data = torch.load(os.path.join(p, f), weights_only=False)
-                if "unc_stats" not in data:
+                try:
+                    assert 0
+                    data = torch.load(os.path.join(p, f), weights_only=False)
+                    #data["unc_stats"]["knn_sep"]
+                except:
                     filelist2.append(f)
         filelist = filelist2
         print(f"{len(filelist)} files need processing.")
@@ -1487,9 +2075,11 @@ if __name__=="__main__":
         train_ensembles(model_setups, uncertainty_setups)
     elif args.setup==9:
         print("Training a sequence of HEAVY models where only magnitude of augmentations is varied. EU is the unc setup")
-        assert len(args.augs)>0, "Please provide --augs argument as a comma-separated list of floats, e.g. --augs 0,0.1,0.2"
-        augs = [float(a) for a in args.augs.split(",")]
-        model_setups = get_aug_models_heavy(augs=augs)
+        if len(args.augs)>0:
+            augs = [float(a) for a in args.augs.split(",")]
+            model_setups = get_aug_models_heavy(augs=augs)
+        else:
+            model_setups = get_aug_models_heavy()
         uncertainty_setups = {"EU": {"ignore_digits": [2, 3, 5], "ambiguous_vae_samples": False},}
         train_ensembles(model_setups, uncertainty_setups)
     elif args.setup==10:
