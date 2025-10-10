@@ -11,12 +11,13 @@ import os
 import torch.nn as nn
 import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
-from models import (get_models_dict,
-                    CNN, MLP, CNNDeluxe, MLPDeluxe, str_to_class)
 import argparse
-from scipy.stats import spearmanr
-from sklearn.metrics import roc_curve, roc_auc_score
-from sklearn.calibration import _sigmoid_calibration
+
+from stats import (ood_stats, ambiguity_stats, calib_stats, knn_classification_metrics, calib_stats_values)
+from models import (get_models_dict, str_to_class)
+from model_setups import (get_heavy_weight_decay_models, get_epochs_models_heavy, 
+                          get_aug_models_heavy, get_seq_models, get_aug_epoch_models,
+                          get_batch_size_models_heavy)
 
 ROOT_PATH = os.path.dirname(os.path.abspath(__file__))
 if ROOT_PATH=="/home/jloch/Desktop/diff/luzern/random_experiments/mnist":
@@ -143,390 +144,8 @@ def class_density_map(X, y, std_mult=0.05, max_sidelength=256, truncate=3, squar
 
     return prob_map, summed_density, x_vec, y_vec
 
-def _per_point_sigma_same_class(X, y, neighbour_std=10, tqdm_disable=False):
-    """
-    For each point i, compute sigma_i as the std of the distances to the
-    'neighbour_std' nearest NEIGHBORS OF THE SAME CLASS (excluding itself).
-    Returns sigma_world of shape (N,).
-    """
-    N = X.shape[0]
-    sigma_world = np.zeros(N, dtype=np.float64)
-    eps = 1e-12
-
-    # Prefer fast kNN backends if available
-    backend = None
-    NearestNeighbors = None
-    KDTree = None
-    try:
-        from sklearn.neighbors import NearestNeighbors as _NN
-        NearestNeighbors = _NN
-        backend = "sklearn"
-    except Exception:
-        try:
-            from scipy.spatial import cKDTree as _KD
-            KDTree = _KD
-            backend = "ckdtree"
-        except Exception:
-            backend = "brute"
-
-    classes = np.unique(y)
-    loop_var = classes
-    if not tqdm_disable:
-        loop_var = tqdm(loop_var, desc="kNN (same class)", ncols=80, leave=False)
-
-    for c in loop_var:
-        idx = np.where(y == c)[0]
-        if idx.size <= 1:
-            sigma_world[idx] = 1.0  # arbitrary fallback if class has 0/1 samples
-            continue
-
-        Xc = X[idx]
-        k = min(neighbour_std, Xc.shape[0]-1)
-
-        if backend == "sklearn":
-            nn = NearestNeighbors(n_neighbors=k+1, algorithm="auto", metric="euclidean")
-            nn.fit(Xc)
-            dists, _ = nn.kneighbors(Xc, return_distance=True)  # includes self at col 0
-            # take neighbors 1..k
-            d_k = dists[:, 1:k+1]
-        elif backend == "ckdtree":
-            tree = KDTree(Xc)
-            d_k, _ = tree.query(Xc, k=k+1)  # includes self at col 0
-            if k == 1:
-                # shape (n,) when k=1; make it 2D
-                d_k = np.atleast_2d(d_k).T
-            d_k = d_k[:, 1:k+1]
-        else:  # brute force (O(n^2) for this class)
-            # Compute pairwise distances within class
-            # Use chunking if memory is a concern; here we keep it simple
-            D = np.sqrt(((Xc[:, None, :] - Xc[None, :, :])**2).sum(axis=2))
-            # set self-distance to +inf so argpartition ignores self for nearest neighbors
-            np.fill_diagonal(D, np.inf)
-            # pick k smallest per row via argpartition
-            part_idx = np.argpartition(D, kth=k-1, axis=1)[:, :k]
-            # gather distances and compute std row-wise
-            rows = np.arange(Xc.shape[0])[:, None]
-            d_k = D[rows, part_idx]
-
-        sigmas_c = d_k.std(axis=1)
-        # Guard against zeros (identical points) or numerical issues
-        sigmas_c = np.maximum(sigmas_c, eps)
-
-        sigma_world[idx] = sigmas_c
-
-    return sigma_world
-
-from sklearn.neighbors import NearestNeighbors
-
-def knn_classification_metrics(out_dict, k=10, num_classes=None, metric="euclidean"):
-    """
-    Leave-one-out KNN on the full dataset.
-
-    Parameters
-    ----------
-    X : (N, D) array-like
-    y : (N,) int array-like, labels in [0..C-1]
-    k : int, number of neighbors (excluding self)
-    num_classes : int or None (auto -> max(y)+1)
-    metric : str, currently only 'euclidean' is supported
-
-    Returns
-    -------
-    results : dict with keys
-        'per_class_acc_majority' : (C,) float array
-        'per_class_acc_soft'     : (C,) float array
-        'weighted_acc_majority'  : float
-        'weighted_acc_soft'      : float
-        'support'                : (C,) int array (class counts)
-    """
-    iid_mask = out_dict["eval"]["iid_mask"]
-    vae_mask = out_dict["eval"]["vae_mask"]
-    AU = out_dict["eval"]["unc"]["AU"].numpy()
-    EU = out_dict["eval"]["unc"]["EU"].numpy()
-    masks = [np.where(~vae_mask & iid_mask)[0],
-                np.where(~vae_mask & ~iid_mask)[0],
-                np.where(vae_mask & iid_mask)[0],
-                np.where(vae_mask & ~iid_mask)[0]]
-
-    x = [np.log10(AU[mask]) for mask in masks]
-    y = [np.log10(EU[mask]) for mask in masks]
-    X = np.stack([np.concatenate(x,axis=0),np.concatenate(y,axis=0)],axis=1)
-    y = np.array(sum([[i for _ in range(len(xi))] for i,xi in enumerate(x)],[]))
-    N = X.shape[0]
-    if N == 0:
-        raise ValueError("Empty dataset.")
-    if metric != "euclidean":
-        raise ValueError("Only Euclidean distance supported in this implementation.")
-
-    if num_classes is None:
-        num_classes = int(y.max()) + 1
-
-    k = int(k)
-    if k < 1:
-        raise ValueError("k must be >= 1")
-    if k >= N:
-        raise ValueError("k must be less than the number of samples (leave-one-out requires k < N).")
-
-    nn = NearestNeighbors(n_neighbors=k+1, algorithm="auto", metric="euclidean")
-    nn.fit(X)
-    dists, idxs = nn.kneighbors(X, return_distance=True)
-    # drop self (the first neighbor should be itself; if duplicates exist, still okay to drop col 0)
-    idxs = idxs[:, 1:k+1]
-    # --- Gather neighbor labels ---
-    neigh_labels = y[idxs]  # (N, k)
-
-    # --- Counts per class in each neighborhood ---
-    # We'll use np.bincount row-wise.
-    counts = np.zeros((N, num_classes), dtype=np.int32)
-    for c in range(num_classes):
-        counts[:, c] = (neigh_labels == c).sum(axis=1)
-
-    # Majority-vote prediction (ties → lowest class id)
-    maj_pred = counts.argmax(axis=1)
-
-    # Correctness indicators
-    correct_majority = (maj_pred == y).astype(np.float64)
-
-    # Soft accuracy (probability of picking the correct class at random from the
-    # neighbor class-frequency distribution): p = count(true_class)/k
-    true_counts = counts[np.arange(N), y]
-    soft_acc = true_counts / float(k)
-
-    # --- Per-class accuracies ---
-    support = np.bincount(y, minlength=num_classes)
-    per_class_acc_majority = np.zeros(num_classes, dtype=np.float64)
-    per_class_acc_soft = np.zeros(num_classes, dtype=np.float64)
-
-    for c in range(num_classes):
-        mask = (y == c)
-        n_c = support[c]
-        if n_c > 0:
-            per_class_acc_majority[c] = correct_majority[mask].mean()
-            per_class_acc_soft[c] = soft_acc[mask].mean()
-        else:
-            per_class_acc_majority[c] = np.nan  # no samples of this class
-            per_class_acc_soft[c] = np.nan
-
-    # --- Weighted overall accuracies (weights = class supports) ---
-    total = support.sum()
-    # Only include classes with support > 0
-    nonzero = support > 0
-    weighted_acc_majority = float((support[nonzero] * per_class_acc_majority[nonzero]).sum() / total)
-    weighted_acc_soft = float((support[nonzero] * per_class_acc_soft[nonzero]).sum() / total)
-
-    return {
-        "per_class_acc_majority": per_class_acc_majority,
-        "per_class_acc_soft": per_class_acc_soft,
-        "weighted_acc_majority": weighted_acc_majority,
-        "weighted_acc_soft": weighted_acc_soft,
-        "support": support,
-    }
-
-def class_hist2d_map(X, y, x_vec, y_vec, num_classes=10):
-    """
-    Simple 2D histogram density estimator aligned with x_vec, y_vec.
-    The bins are centered on x_vec, y_vec (consistent with class_density_map).
-    
-    Parameters
-    ----------
-    X : (N, 2)
-        Data coordinates.
-    y : (N,)
-        Integer class labels in [0 .. num_classes-1].
-    x_vec, y_vec : (S,), (S,)
-        Grid coordinates (bin centers) in each dimension.
-    num_classes : int
-        Number of distinct classes.
-
-    Returns
-    -------
-    prob_map : (S, S, num_classes)
-        Normalized class probabilities per pixel.
-    summed_density : (S, S)
-        Total count per pixel.
-    density : (S, S, num_classes)
-        Raw class counts.
-    """
-    X = np.asarray(X, dtype=np.float64)
-    y = np.asarray(y, dtype=np.int64)
-    Sx, Sy = len(x_vec), len(y_vec)
-
-    # Compute bin edges from centers (assume uniform spacing)
-    if len(x_vec) < 2 or len(y_vec) < 2:
-        raise ValueError("x_vec and y_vec must have length >= 2 to define bin edges")
-
-    dx = x_vec[1] - x_vec[0]
-    dy = y_vec[1] - y_vec[0]
-    x_edges = np.concatenate(([x_vec[0] - dx/2], x_vec + dx/2))
-    y_edges = np.concatenate(([y_vec[0] - dy/2], y_vec + dy/2))
-
-    # Initialize outputs
-    density = np.zeros((Sy, Sx, num_classes), dtype=np.float64)
-
-    # Count per class
-    for c in range(num_classes):
-        mask = (y == c)
-        if not np.any(mask):
-            continue
-        H, _, _ = np.histogram2d(
-            X[mask, 1], X[mask, 0],
-            bins=[y_edges, x_edges]
-        )
-        density[:, :, c] = H
-
-    # Total and normalized maps
-    summed_density = density.sum(axis=2)
-    prob_map = density / np.clip(summed_density[..., None], 1e-12, None)
-
-    return prob_map, summed_density, density
-
-
-def class_density_map2(
-    X, y,
-    neighbour_std=10,
-    std_mult=3,
-    pad_rel=0.10,
-    max_sidelength=256,
-    truncate=3,
-    square=True,
-    tqdm_disable=False,
-    num_classes=10
-):
-    """
-    X: (N,2) t-SNE coordinates
-    y: (N,) integer labels in [0..9]
-    neighbour_std: int, number of same-class neighbors used to compute per-point sigma
-    pad_rel: float, relative padding of the data span. pad_rel=0.1 -> add 5% of span to each side
-    max_sidelength: int, grid size (SxS)
-    truncate: float, kernel radius in multiples of sigma (used for efficiency window)
-    square: bool, if True, expand to square bounds
-    tqdm_disable: bool, disable progress bars
-
-    Returns:
-        prob_map (S,S,10),
-        summed_density (S,S),
-        x_vec (S,),
-        y_vec (S,)
-    """
-    X = np.asarray(X, dtype=np.float64)
-    y = np.asarray(y, dtype=np.int64)
-    S = int(max_sidelength)
-
-    if X.ndim != 2 or X.shape[1] != 2:
-        raise ValueError("X must be of shape (N, 2)")
-
-    N = X.shape[0]
-    if N == 0:
-        # empty input: return degenerate maps
-        prob_map = np.zeros((S, S, num_classes), dtype=np.float64)
-        summed_density = np.zeros((S, S), dtype=np.float64)
-        x_vec = np.linspace(0, 1, S)
-        y_vec = np.linspace(0, 1, S)
-        return prob_map, summed_density, x_vec, y_vec
-
-    # --- per-point bandwidth (world units) from same-class neighbor std ---
-    sigma_world = _per_point_sigma_same_class(
-        X, y, neighbour_std=neighbour_std, tqdm_disable=tqdm_disable
-    )
-    sigma_world *= float(std_mult)
-
-    # --- bounds with RELATIVE padding ---
-    xmin, xmax = X[:, 0].min(), X[:, 0].max()
-    ymin, ymax = X[:, 1].min(), X[:, 1].max()
-    span_x = xmax - xmin
-    span_y = ymax - ymin
-    if span_x <= 0: span_x = 1e-8
-    if span_y <= 0: span_y = 1e-8
-
-    # Interpret pad_rel as TOTAL padding fraction; split equally per side (5% each side if pad_rel=0.1)
-    padx_each = 0.5 * pad_rel * span_x
-    pady_each = 0.5 * pad_rel * span_y
-    xmin_p, xmax_p = xmin - padx_each, xmax + padx_each
-    ymin_p, ymax_p = ymin - pady_each, ymax + pady_each
-
-    # --- optional square bounds by expanding the smaller span ---
-    if square:
-        span_xp = xmax_p - xmin_p
-        span_yp = ymax_p - ymin_p
-        if span_xp <= 0: span_xp = 1e-8
-        if span_yp <= 0: span_yp = 1e-8
-        if span_xp > span_yp:
-            extra = 0.5 * (span_xp - span_yp)
-            ymin_p -= extra
-            ymax_p += extra
-        elif span_yp > span_xp:
-            extra = 0.5 * (span_yp - span_xp)
-            xmin_p -= extra
-            xmax_p += extra
-
-    # --- grid vectors (data-space coordinates per pixel center) ---
-    x_vec = np.linspace(xmin_p, xmax_p, S)
-    y_vec = np.linspace(ymin_p, ymax_p, S)
-
-    # pixel size in data units
-    dx = (xmax_p - xmin_p) / (S - 1) if S > 1 else 1.0
-    dy = (ymax_p - ymin_p) / (S - 1) if S > 1 else 1.0
-    if dx <= 0: dx = 1e-8
-    if dy <= 0: dy = 1e-8
-
-    density = np.zeros((S, S, num_classes), dtype=np.float64)
-
-    # --- map data coords to fractional pixel coords ---
-    fx = (X[:, 0] - xmin_p) / dx  # 0..S-1 (fractional)
-    fy = (X[:, 1] - ymin_p) / dy
-
-    loop_var = range(N)
-    if not tqdm_disable:
-        loop_var = tqdm(loop_var, desc="Building density map", ncols=80, leave=False)
-
-    eps = 1e-12
-    for i in loop_var:
-        c = int(y[i])
-        if c < 0 or c >= num_classes:
-            continue
-
-        # per-point sigma (isotropic in world units)
-        sig_w = max(float(sigma_world[i]), eps)
-        sigma_x_pix = max(sig_w / dx, eps)
-        sigma_y_pix = max(sig_w / dy, eps)
-
-        rx = int(np.ceil(truncate * sigma_x_pix))
-        ry = int(np.ceil(truncate * sigma_y_pix))
-        if rx < 1 and ry < 1:
-            rx = ry = 1  # ensure at least a single pixel support
-
-        cx = fx[i]
-        cy = fy[i]
-
-        # window bounds (inclusive) with clipping
-        x0 = max(0, int(np.floor(cx - rx)))
-        x1 = min(S - 1, int(np.ceil(cx + rx)))
-        y0 = max(0, int(np.floor(cy - ry)))
-        y1 = min(S - 1, int(np.ceil(cy + ry)))
-        if x1 < x0 or y1 < y0:
-            continue
-
-        xs = np.arange(x0, x1 + 1)
-        ys = np.arange(y0, y1 + 1)
-
-        # subpixel distances in pixel units (separable Gaussian)
-        dxp = (xs - cx) / sigma_x_pix
-        dyp = (ys - cy) / sigma_y_pix
-        gx = np.exp(-0.5 * (dxp ** 2))
-        gy = np.exp(-0.5 * (dyp ** 2))
-        kernel = np.outer(gy, gx)  # (len(ys), len(xs))
-        kernel /= kernel.sum()  # normalize per-point kernel to sum to 1
-
-        density[y0:y1 + 1, x0:x1 + 1, c] += kernel
-
-    summed_density = density.sum(axis=2)
-    prob_map = density / np.clip(summed_density[..., None], 1e-12, None)
-
-    return prob_map, density, summed_density, x_vec, y_vec
-
-
 def get_dataloaders(root=DATA_PATH,
-    batch_size=64, num_workers=4, shuffle_train=True, ignore_digits=[],
+    batch_size=256, num_workers=4, shuffle_train=True, ignore_digits=[],
     augment=False, interpolation_factor=0.0, ambiguous_vae_samples=False
 ):
     """
@@ -665,16 +284,48 @@ class MNISTWithTSNE(Dataset):
 def dict2str(d):
     return ", ".join([f"{k}: {v}" for k, v in d.items()])
 
+def scaled_lr(lr_ref, bs_ref, bs):
+    """
+    Scale the learning rate according to batch size using a hybrid sqrt→linear rule.
+
+    Args:
+        lr_ref (float): reference learning rate.
+        bs_ref (int): reference batch size.
+        bs (int or float): new batch size.
+
+    Returns:
+        float: scaled learning rate.
+    """
+    bs = float(bs)
+    log_bs = np.log2(bs)
+    log_512 = np.log2(512)
+    log_8192 = np.log2(8192)
+
+    # Determine alpha (exponent for scaling)
+    if bs <= 512:
+        alpha = 0.5
+    elif bs >= 8192:
+        alpha = 1.0
+    else:
+        # linear interpolation in log2 space
+        alpha = 0.5 + 0.5 * (log_bs - log_512) / (log_8192 - log_512)
+
+    # Scaled learning rate
+    lr = lr_ref * (bs / bs_ref) ** alpha
+    return float(lr)
+
 def train(
     model, train_dl, val_dl, epochs=20, lr=1e-4, weight_decay=0.0,
     device=None, val_every_steps=500, kl_scale=0.0, n_vali_samples=1000, fixed_vali_samples=False,
     tqdm_disable=False, cosine_anneal_epochs=20, soft_labels=False, ckpt_every_epochs=0,
-    also_save_ema_ckpts=False, epoch_ema_memory=1
+    also_save_ema_ckpts=False, epoch_ema_memory=1, lr_decay=1.0,
+    normalize_lr_wrt_batch_size=64,
 ):
     """
     Basic training loop with BCEWithLogitsLoss + Adam.
     Logs training metrics every step and validation every val_every_steps.
     """
+    lr = scaled_lr(lr, normalize_lr_wrt_batch_size, train_dl.batch_size)
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     if also_save_ema_ckpts:
@@ -683,7 +334,6 @@ def train(
             ema_state_dict[k] = model.state_dict()[k].detach().cpu().clone()
         memory = len(train_dl)*epoch_ema_memory
         ema_lambda = (memory - 1) / memory
-        print(f"ema_lambda: {ema_lambda:.6f}")
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
@@ -797,12 +447,24 @@ def train(
                 history["val_acc"].append(val_acc)
                 
                 model.train()  # back to train mode
-        if ckpt_every_epochs and ckpt_every_epochs > 0 and (epoch % ckpt_every_epochs == 0):
-            state_dict_detached = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            history["ckpt_epochs"][epoch] = state_dict_detached
-            if also_save_ema_ckpts:
-                ema_state_dict_clone = {k: v.clone() for k, v in ema_state_dict.items()}
-                history["ema_ckpt_epochs"][epoch] = ema_state_dict_clone
+        # --- End epoch ---
+        # Decay lr per epoch if requested
+        if lr_decay != 1.0:
+            for pg in optimizer.param_groups:
+                pg['lr'] *= lr_decay
+        if ckpt_every_epochs:
+            if isinstance(ckpt_every_epochs, int):
+                save_ckpt_epoch_flag = ckpt_every_epochs > 0 and (epoch % ckpt_every_epochs == 0)
+            elif isinstance(ckpt_every_epochs, (list, tuple)):
+                save_ckpt_epoch_flag = epoch in ckpt_every_epochs
+            else:
+                raise ValueError(f"ckpt_every_epochs must be int or list/tuple of ints, found {type(ckpt_every_epochs)}")
+            if save_ckpt_epoch_flag:
+                state_dict_detached = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                history["ckpt_epochs"][epoch] = state_dict_detached
+                if also_save_ema_ckpts:
+                    ema_state_dict_clone = {k: v.clone() for k, v in ema_state_dict.items()}
+                    history["ema_ckpt_epochs"][epoch] = ema_state_dict_clone
 
     return history
 
@@ -940,156 +602,6 @@ def loss_plot(history):
     plt.show()
 
 
-def model_from_cfg(m_cfg, as_func=False):
-    model_name = m_cfg["model"]
-    model_dict_old = get_models_dict(tsne=m_cfg.get("tsne", False))
-    if model_name in model_dict_old:
-        model = lambda: model_dict_old[model_name]()
-    else:
-        assert model_name in str_to_class, f"Unknown model {model_name}, expected one of {list(str_to_class.keys())}"
-        model = lambda: str_to_class[model_name](**m_cfg.get("model_args", {}))
-    if as_func:
-        return model
-    else:
-        return model()
-
-def train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10, 
-                    save_dir=os.path.join(ROOT_PATH, "saves"),
-                    skip_existing=True):
-    """
-    Train ensembles of models across uncertainty and model setups.
-
-    Loop order (outer→inner): uncertainty_setups → model_setups → model repeat index.
-
-    For every (uncertainty_setup, model_setup) pair:
-        * Train n_models_per_setup instances (with different random seeds) sequentially.
-        * After finishing all n models, save a .pth file in save_dir containing:
-            - "checkpoints": list[ dict ] of state_dicts (CPU) length n_models_per_setup
-            - "histories": list of training history dicts (as returned by train())
-            - "final_acc": list of tuples (train_acc, test_acc) evaluated on FULL sets (no augmentation)
-            - metadata: "uncertainty_setup", "model_setup", plus the configuration dicts
-    Filename pattern:  f"{uncertainty_key}__{model_key}.pth"
-
-    Notes / Assumptions:
-        * Data augmentation only applied to training dataloader if model_setup["data_aug"] is True.
-        * Evaluation (train + test accuracy) always uses un-augmented transforms (setting augment=False).
-        * If a model_setup provides "tsne": True we pass tsne flag when constructing model.
-        * au_factor currently only stored (no AU synthesis logic present in this file); kept for future extension.
-        * Seeds: we vary torch.manual_seed, numpy, and random for reproducibility per model.
-    """
-    print(f"Total setups: {len(model_setups)}")
-    os.makedirs(save_dir, exist_ok=True)
-
-
-    # Outer loop: uncertainty setups
-    for u_key, u_cfg in uncertainty_setups.items():
-        # Inner loop: model setups
-        for m_key, m_cfg in model_setups.items():
-            #model_name = m_cfg.get("model")
-            if skip_existing:
-                fname = f"{u_key}__{m_key}.pth"
-                fpath = os.path.join(save_dir, fname)
-                if os.path.isfile(fpath):
-                    print(f"Skipping existing file {fpath}")
-                    continue
-            train_dl_aug, val_dl_aug = get_dataloaders(ignore_digits=u_cfg.get("ignore_digits", []), 
-                                                        augment=m_cfg.get("data_aug", False),
-                                                        ambiguous_vae_samples=u_cfg.get("ambiguous_vae_samples", 0))
-
-            checkpoints = []
-            histories = []
-            final_acc = []
-
-            for model_idx in range(n_models_per_setup):
-                seed = 1234 + model_idx  # deterministic but distinct
-                random.seed(seed)
-                np.random.seed(seed)
-                torch.manual_seed(seed)
-                if torch.cuda.is_available():
-                    torch.cuda.manual_seed_all(seed)
-
-                model = model_from_cfg(m_cfg)
-                #model = get_models_dict(tsne=m_cfg.get("tsne", False), channel_mult=m_cfg.get("channel_mult", 1))[model_name]()
-
-                history = train(
-                    model,
-                    train_dl=train_dl_aug,
-                    val_dl=val_dl_aug,
-                    epochs               = m_cfg.get("epochs", 20),
-                    lr                   = m_cfg.get("lr", 1e-4),
-                    weight_decay         = m_cfg.get("weight_decay", 0.0),
-                    val_every_steps      = m_cfg.get("val_every_steps", 500),
-                    kl_scale             = m_cfg.get("kl_scale", 0.0),
-                    n_vali_samples       = m_cfg.get("n_vali_samples", 1000),
-                    fixed_vali_samples   = m_cfg.get("fixed_vali_samples", False),
-                    tqdm_disable         = m_cfg.get("tqdm_disable", False),
-                    cosine_anneal_epochs = m_cfg.get("cosine_anneal_epochs", m_cfg.get("epochs", 20)),
-                    soft_labels = u_cfg.get("soft_labels", False)
-                )
-
-                # Final evaluation on FULL (un-augmented) train + test
-                train_dl_eval, test_dl_eval = get_dataloaders(ignore_digits=u_cfg.get("ignore_digits", []), 
-                                                              ambiguous_vae_samples=u_cfg.get("ambiguous_vae_samples", 0),
-                                                        augment=False, shuffle_train=False)
-                train_probs, test_probs = model_probs_on_all_points(
-                    model, [train_dl_eval, test_dl_eval],
-                )
-                #(train_probs.argmax(axis=1) == train_dl.dataset.base.targets).float().mean()
-                #train_acc = (train_probs.argmax(dim=1) == torch.as_tensor(train_dl_eval.dataset.base.targets)).float().mean().item()
-                #test_acc  = (test_probs.argmax(dim=1)  == torch.as_tensor(test_dl_eval.dataset.base.targets)).float().mean().item()
-                train_acc = (train_dl_eval.dataset.probs[torch.arange(len(train_dl_eval.dataset)),train_probs.argmax(axis=1)]).mean()
-                test_acc = (test_dl_eval.dataset.probs[torch.arange(len(test_dl_eval.dataset)),test_probs.argmax(axis=1)]).mean()
-                print(f"Model {model_idx+1}/{n_models_per_setup} ({u_key}, {m_key}): Train Acc: {train_acc:.4f}, Test Acc: {test_acc:.4f}")
-
-                # Store CPU checkpoint
-                checkpoints.append({k: v.cpu() for k, v in model.state_dict().items()})
-                histories.append(history)
-                final_acc.append({"train_acc": train_acc, "test_acc": test_acc})
-
-            save_obj = {
-                "checkpoints": checkpoints,
-                "histories": histories,
-                "final_acc": final_acc,  # list[(train_acc, test_acc)]
-                "uncertainty_setup": u_cfg,
-                "model_setup": m_cfg,
-            }
-            fname = f"{u_key}__{m_key}.pth"
-            fpath = os.path.join(save_dir, fname)
-            torch.save(save_obj, fpath)
-            print(f"Saved ensemble results to {fpath}")
-    return None
-
-def calculate_uncertainty(softmax_preds: torch.Tensor):
-    """ Assumes shape structure:
-     (N, C, H, W) where N is number of stochastic forward passes,
-     C is number of classes, H is height, and W is width.
-    """
-    mean_softmax = torch.mean(softmax_preds, dim=0)
-    pred_entropy = torch.zeros(*softmax_preds.shape[2:], device=mean_softmax.device)
-    for y in range(mean_softmax.shape[0]):
-        pred_entropy_class = mean_softmax[y] * torch.log(mean_softmax[y])
-        nan_pos = torch.isnan(pred_entropy_class)
-        pred_entropy[~nan_pos] += pred_entropy_class[~nan_pos]
-    pred_entropy *= -1
-    expected_entropy = torch.zeros(
-        softmax_preds.shape[0], *softmax_preds.shape[2:], device=softmax_preds.device
-    )
-    for pred in range(softmax_preds.shape[0]):
-        entropy = torch.zeros(*softmax_preds.shape[2:], device=softmax_preds.device)
-        for y in range(softmax_preds.shape[1]):
-            entropy_class = softmax_preds[pred, y] * torch.log(softmax_preds[pred, y])
-            nan_pos = torch.isnan(entropy_class)
-            entropy[~nan_pos] += entropy_class[~nan_pos]
-        entropy *= -1
-        expected_entropy[pred] = entropy
-    expected_entropy = torch.mean(expected_entropy, dim=0)
-    mutual_information = pred_entropy - expected_entropy
-    negative_mask = mutual_information < 0
-    mutual_information[negative_mask] = mutual_information[~negative_mask].min()
-    return {"TU": pred_entropy,
-            "AU": expected_entropy,
-            "EU": mutual_information}
-
 def idx_to_mask(idx, total_length):
     mask = torch.zeros(total_length, dtype=torch.bool)
     if isinstance(idx, slice):
@@ -1207,22 +719,205 @@ def uncertainty_stats_from_ckpts(data, resolution=256, tqdm_disable=False, inclu
         out_dict["amb_stats"] = ambiguity_stats(out_dict)#, mask=mask, vae_mask=vae_mask)
     return out_dict
 
+def model_from_cfg(m_cfg, as_func=False):
+    model_name = m_cfg["model"]
+    model_dict_old = get_models_dict(tsne=m_cfg.get("tsne", False))
+    if model_name in model_dict_old:
+        model = lambda: model_dict_old[model_name]()
+    else:
+        assert model_name in str_to_class, f"Unknown model {model_name}, expected one of {list(str_to_class.keys())}"
+        model = lambda: str_to_class[model_name](**m_cfg.get("model_args", {}))
+    if as_func:
+        return model
+    else:
+        return model()
 
-def auroc(unc_score, is_ood, do_plot=False):
-    """Computes AUROC for a set of 0/1 labels (is_ood) given uncertainty scores (higher = more uncertain).
+def train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10, 
+                    save_dir=os.path.join(ROOT_PATH, "saves"),
+                    skip_existing=True):
     """
-    fpr, tpr, thresholds = roc_curve(is_ood, unc_score)
-    auc = roc_auc_score(is_ood, unc_score)
-    if do_plot:
-        plt.plot(fpr, tpr, linewidth=0.7)
-        plt.plot([0,1],[0,1],"k--")
-        plt.xlim(0,1)
-        plt.ylim(0,1)
-        plt.xlabel("False Positive Rate")
-        plt.ylabel("True Positive Rate")
-        plt.grid(True)
-    return auc, fpr, tpr, thresholds
-    
+    Train ensembles of models across uncertainty and model setups.
+
+    Loop order (outer→inner): uncertainty_setups → model_setups → model repeat index.
+
+    For every (uncertainty_setup, model_setup) pair:
+        * Train n_models_per_setup instances (with different random seeds) sequentially.
+        * After finishing all n models, save a .pth file in save_dir containing:
+            - "checkpoints": list[ dict ] of state_dicts (CPU) length n_models_per_setup
+            - "histories": list of training history dicts (as returned by train())
+            - "final_acc": list of tuples (train_acc, test_acc) evaluated on FULL sets (no augmentation)
+            - metadata: "uncertainty_setup", "model_setup", plus the configuration dicts
+    Filename pattern:  f"{uncertainty_key}__{model_key}.pth"
+
+    Notes / Assumptions:
+        * Data augmentation only applied to training dataloader if model_setup["data_aug"] is True.
+        * Evaluation (train + test accuracy) always uses un-augmented transforms (setting augment=False).
+        * If a model_setup provides "tsne": True we pass tsne flag when constructing model.
+        * au_factor currently only stored (no AU synthesis logic present in this file); kept for future extension.
+        * Seeds: we vary torch.manual_seed, numpy, and random for reproducibility per model.
+    """
+    print(f"Total setups: {len(model_setups)}")
+    os.makedirs(save_dir, exist_ok=True)
+
+
+    # Outer loop: uncertainty setups
+    for u_key, u_cfg in uncertainty_setups.items():
+        # Inner loop: model setups
+        for m_key, m_cfg in model_setups.items():
+            if isinstance(m_cfg.get("epochs", 20),list):
+                epoch_list = m_cfg["epochs"]
+                m_cfg["epochs"] = max(epoch_list)
+                epoch_mode = True
+                ckpt_every_epochs = epoch_list
+            else:
+                epoch_mode = False
+                ckpt_every_epochs = 0
+            #model_name = m_cfg.get("model")
+            if skip_existing and not epoch_mode:
+                fname = f"{u_key}__{m_key}.pth"
+                fpath = os.path.join(save_dir, fname)
+                if os.path.isfile(fpath):
+                    print(f"Skipping existing file {fpath}")
+                    continue
+            train_dl_aug, val_dl_aug = get_dataloaders(ignore_digits=u_cfg.get("ignore_digits", []), 
+                                                        augment=m_cfg.get("data_aug", False),
+                                                        ambiguous_vae_samples=u_cfg.get("ambiguous_vae_samples", 0),
+                                                        batch_size=m_cfg.get("batch_size", 64),)
+
+            checkpoints = []
+            histories = []
+            final_acc = []
+
+            for model_idx in range(n_models_per_setup):
+                seed = 1234 + model_idx  # deterministic but distinct
+                random.seed(seed)
+                np.random.seed(seed)
+                torch.manual_seed(seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed)
+
+                model = model_from_cfg(m_cfg)
+                #model = get_models_dict(tsne=m_cfg.get("tsne", False), channel_mult=m_cfg.get("channel_mult", 1))[model_name]()
+
+                history = train(
+                    model,
+                    train_dl=train_dl_aug,
+                    val_dl=val_dl_aug,
+                    epochs               = m_cfg.get("epochs", 20),
+                    lr                   = m_cfg.get("lr", 1e-4),
+                    weight_decay         = m_cfg.get("weight_decay", 0.0),
+                    val_every_steps      = m_cfg.get("val_every_steps", 500),
+                    kl_scale             = m_cfg.get("kl_scale", 0.0),
+                    n_vali_samples       = m_cfg.get("n_vali_samples", 1000),
+                    fixed_vali_samples   = m_cfg.get("fixed_vali_samples", False),
+                    tqdm_disable         = m_cfg.get("tqdm_disable", False),
+                    cosine_anneal_epochs = m_cfg.get("cosine_anneal_epochs", m_cfg.get("epochs", 20)),
+                    soft_labels          = u_cfg.get("soft_labels", False),
+                    lr_decay    = m_cfg.get("lr_decay", 1.0),
+                    ckpt_every_epochs    = ckpt_every_epochs,
+                    also_save_ema_ckpts  = m_cfg.get("also_save_ema_ckpts", False)
+                )
+
+                # Final evaluation on FULL (un-augmented) train + test
+                train_dl_eval, test_dl_eval = get_dataloaders(ignore_digits=u_cfg.get("ignore_digits", []), 
+                                                              ambiguous_vae_samples=u_cfg.get("ambiguous_vae_samples", 0),
+                                                        augment=False, shuffle_train=False)
+                if epoch_mode:
+                    # remove checkpoints from histories to keep file size down
+                    # and put them in the checkpoints list instead, now a 2d list. 
+                    # similarly for final_acc, evaluate over all the checkpoints and store in a 2d final_acc variable instead of 1d
+                    if m_cfg.get("also_save_ema_ckpts", False):
+                        checkpoints.append({"ema": history.pop("ema_ckpt_epochs"),
+                                            "normal": history.pop("ckpt_epochs")})
+                    else:
+                        checkpoints.append({"normal": history.pop("ckpt_epochs")})
+                    # final acc over normal checkpoints
+                    final_acc.append({})
+                    for ema_or_normal, ckpt_dict in checkpoints[-1].items():
+                        final_acc[-1][ema_or_normal] = {}
+                        for epoch, state_dict in ckpt_dict.items():
+                            model.load_state_dict(state_dict)
+                            train_probs, test_probs = model_probs_on_all_points(
+                                model, [train_dl_eval, test_dl_eval],
+                            )
+                            train_acc = (train_dl_eval.dataset.probs[torch.arange(len(train_dl_eval.dataset)),train_probs.argmax(axis=1)]).mean()
+                            test_acc = (test_dl_eval.dataset.probs[torch.arange(len(test_dl_eval.dataset)),test_probs.argmax(axis=1)]).mean()
+                            final_acc[-1][ema_or_normal][epoch] = {"train_acc": train_acc.item(), "test_acc": test_acc.item()}
+                            print(f"Model {model_idx+1}/{n_models_per_setup} ({u_key}, {m_key}, {ema_or_normal}, epoch {epoch}): Train Acc: {train_acc:.4f}, Test Acc: {test_acc:.4f}")
+                else:
+                    train_probs, test_probs = model_probs_on_all_points(
+                        model, [train_dl_eval, test_dl_eval],
+                    )
+                    train_acc = (train_dl_eval.dataset.probs[torch.arange(len(train_dl_eval.dataset)),train_probs.argmax(axis=1)]).mean()
+                    test_acc = (test_dl_eval.dataset.probs[torch.arange(len(test_dl_eval.dataset)),test_probs.argmax(axis=1)]).mean()
+                    print(f"Model {model_idx+1}/{n_models_per_setup} ({u_key}, {m_key}): Train Acc: {train_acc:.4f}, Test Acc: {test_acc:.4f}")
+
+                    # Store CPU checkpoint
+                    checkpoints.append({k: v.cpu() for k, v in model.state_dict().items()})
+                    histories.append(history)
+                    final_acc.append({"train_acc": train_acc, "test_acc": test_acc})
+            if epoch_mode:
+                # save a checkpoint by appending e.g. _e10_ema or e_10 to the filename
+                # keep histories dictionaries identical for each save
+                # make sure to replace the epoch key in model setup in addition to a "ema" boolean key
+                for ema_or_normal in checkpoints[0].keys():
+                    for epoch in checkpoints[0][ema_or_normal].keys():
+                        save_obj = {
+                            "checkpoints": [ckpt[ema_or_normal][epoch] for ckpt in checkpoints],
+                            "histories": histories,
+                            "final_acc": [fa[ema_or_normal][epoch] for fa in final_acc],  # list[(train_acc, test_acc)]
+                            "uncertainty_setup": u_cfg,
+                            "model_setup": m_cfg,
+                        }
+                        ema_str = "_ema" if ema_or_normal == "ema" else ""
+                        fname = f"{u_key}__{m_key}_e{epoch}{ema_str}.pth"
+                        fpath = os.path.join(save_dir, fname)
+                        torch.save(save_obj, fpath)
+                        print(f"Saved ensemble results to {fpath}")
+            else:
+                save_obj = {
+                    "checkpoints": checkpoints,
+                    "histories": histories,
+                    "final_acc": final_acc,  # list[(train_acc, test_acc)]
+                    "uncertainty_setup": u_cfg,
+                    "model_setup": m_cfg,
+                }
+                fname = f"{u_key}__{m_key}.pth"
+                fpath = os.path.join(save_dir, fname)
+                torch.save(save_obj, fpath)
+                print(f"Saved ensemble results to {fpath}")
+    return None
+
+def calculate_uncertainty(softmax_preds: torch.Tensor):
+    """ Assumes shape structure:
+     (N, C, H, W) where N is number of stochastic forward passes,
+     C is number of classes, H is height, and W is width.
+    """
+    mean_softmax = torch.mean(softmax_preds, dim=0)
+    pred_entropy = torch.zeros(*softmax_preds.shape[2:], device=mean_softmax.device)
+    for y in range(mean_softmax.shape[0]):
+        pred_entropy_class = mean_softmax[y] * torch.log(mean_softmax[y])
+        nan_pos = torch.isnan(pred_entropy_class)
+        pred_entropy[~nan_pos] += pred_entropy_class[~nan_pos]
+    pred_entropy *= -1
+    expected_entropy = torch.zeros(
+        softmax_preds.shape[0], *softmax_preds.shape[2:], device=softmax_preds.device
+    )
+    for pred in range(softmax_preds.shape[0]):
+        entropy = torch.zeros(*softmax_preds.shape[2:], device=softmax_preds.device)
+        for y in range(softmax_preds.shape[1]):
+            entropy_class = softmax_preds[pred, y] * torch.log(softmax_preds[pred, y])
+            nan_pos = torch.isnan(entropy_class)
+            entropy[~nan_pos] += entropy_class[~nan_pos]
+        entropy *= -1
+        expected_entropy[pred] = entropy
+    expected_entropy = torch.mean(expected_entropy, dim=0)
+    mutual_information = pred_entropy - expected_entropy
+    negative_mask = mutual_information < 0
+    mutual_information[negative_mask] = mutual_information[~negative_mask].min()
+    return {"TU": pred_entropy,
+            "AU": expected_entropy,
+            "EU": mutual_information}
 
 def plot_voronoi(out_dict, colorbar=False, title="", cmap="viridis", vmax=1.0, plot_digits=True):
     titles = [title, "TU", "AU", "EU"]
@@ -1261,586 +956,6 @@ def plot_voronoi(out_dict, colorbar=False, title="", cmap="viridis", vmax=1.0, p
         plt.xticks([])
         plt.yticks([])
     plt.tight_layout()
-
-def ece(probs, labels, n_bins=20, equal_bin_weight=False, return_bins=False):
-    """Computes Expected Calibration Error (ECE) for a set of predicted probabilities and true labels.
-    probs: (N,C) array of predicted class probabilities
-    labels: (N,) array of true class labels (integers in [0,C-1])
-    n_bins: number of bins to use
-    equal_bin_weight: if True, each bin contributes equally to the final ECE; otherwise weighted by bin size.
-    """
-    preds = np.argmax(probs, axis=1)
-    confidences = np.max(probs, axis=1)
-    accuracies = (preds == labels).astype(float)
-
-    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
-    bin_indices = np.digitize(confidences, bin_edges, right=True) - 1
-    bin_indices = np.clip(bin_indices, 0, n_bins - 1)
-
-    ece = []
-    bin_sizes = []
-    for b in range(n_bins):
-        bin_mask = (bin_indices == b)
-        bin_size = np.sum(bin_mask)
-        if bin_size > 0:
-            bin_confidence = np.mean(confidences[bin_mask])
-            bin_accuracy = np.mean(accuracies[bin_mask])
-            ece.append(np.abs(bin_accuracy - bin_confidence))
-            bin_sizes.append(bin_size)
-        else:
-            ece.append(0.0)
-            bin_sizes.append(0)
-    if return_bins:
-        return ece, bin_sizes
-    else:
-        if equal_bin_weight:
-            return sum(ece)/len(ece)
-        else:
-            return sum([e * s for e, s in zip(ece, bin_sizes)]) / (sum(bin_sizes)+1e-12)
-
-
-def _fit_platt_scaling_binary(scores, labels):
-    pos = np.count_nonzero(labels > 0.5)
-    neg = np.count_nonzero(labels <= 0.5)
-    if pos == 0 or neg == 0:
-        p = np.clip(labels.mean(), 1e-4, 1 - 1e-4)
-        return 0.0, float(np.log((1 - p) / p))
-    return _sigmoid_calibration(scores, labels)
-
-
-def _fit_platt_scaling_weighted(scores, fractional_correct):
-    eps = 1e-12
-    pos_mask = fractional_correct > eps
-    neg_mask = (1.0 - fractional_correct) > eps
-
-    if not np.any(pos_mask) or not np.any(neg_mask):
-        p = np.clip(fractional_correct.mean(), 1e-4, 1 - 1e-4)
-        return 0.0, float(np.log((1 - p) / p))
-
-    y_true = np.concatenate([np.ones(pos_mask.sum()), np.zeros(neg_mask.sum())])
-    expanded_scores = np.concatenate([scores[pos_mask], scores[neg_mask]])
-    weights = np.concatenate([fractional_correct[pos_mask], (1.0 - fractional_correct[neg_mask])])
-
-    return _sigmoid_calibration(expanded_scores, y_true, sample_weight=weights)
-
-
-def _fit_platt_scaling(uncertainties, correct):
-    uncertainties = np.asarray(uncertainties, dtype=np.float64).reshape(-1)
-    correct = np.asarray(correct, dtype=np.float64).reshape(-1)
-    finite_mask = np.isfinite(uncertainties) & np.isfinite(correct)
-    if not np.any(finite_mask):
-        return 0.0, 0.0
-    uncertainties = uncertainties[finite_mask]
-    correct = correct[finite_mask]
-
-    scores = -uncertainties
-    eps = 1e-12
-    if np.all((correct <= eps) | (correct >= 1 - eps)):
-        labels = (correct >= 0.5).astype(float)
-        return _fit_platt_scaling_binary(scores, labels)
-    else:
-        return _fit_platt_scaling_weighted(scores, correct)
-
-
-def _apply_platt_scaling(uncertainties, a, b):
-    scores = -np.asarray(uncertainties, dtype=np.float64).reshape(-1)
-    logits = scores * a + b
-    logits = np.clip(logits, -60.0, 60.0)
-    confidences = 1.0 / (1.0 + np.exp(logits))
-    return confidences
-
-
-def _calibration_bins(confidences, correct, n_bins=20):
-    confidences = np.asarray(confidences, dtype=np.float64).reshape(-1)
-    correct = np.asarray(correct, dtype=np.float64).reshape(-1)
-    bins = np.linspace(0.0, 1.0 + 1e-8, n_bins + 1)
-    binids = np.digitize(confidences, bins) - 1
-    binids = np.clip(binids, 0, n_bins - 1)
-    bin_total = np.bincount(binids, minlength=n_bins)
-    sum_conf = np.bincount(binids, weights=confidences, minlength=n_bins)
-    sum_correct = np.bincount(binids, weights=correct, minlength=n_bins)
-    nonzero = bin_total > 0
-    bin_conf = np.zeros_like(sum_conf)
-    bin_acc = np.zeros_like(sum_correct)
-    bin_conf[nonzero] = sum_conf[nonzero] / bin_total[nonzero]
-    bin_acc[nonzero] = sum_correct[nonzero] / bin_total[nonzero]
-    discrepancies = np.abs(bin_acc - bin_conf)
-    num_nonzero = int(np.count_nonzero(nonzero))
-    if num_nonzero == 0:
-        ace = 0.0
-    else:
-        ace = float(discrepancies[nonzero].mean())
-    total = bin_total.sum()
-    if total == 0:
-        ece_val = 0.0
-    else:
-        weights = bin_total / total
-        ece_val = float(np.dot(discrepancies, weights))
-    return ace, ece_val, {
-        "bin_conf": bin_conf,
-        "bin_acc": bin_acc,
-        "bin_counts": bin_total,
-        "num_nonzero": num_nonzero,
-    }
-
-
-def calib_stats_values(
-    out_dict,
-    iid_mask=None,
-    vae_mask=None,
-    is_AU2=None,
-    n_bins=20,
-    use_monte_carlo=False,
-    mc_samples=20,
-    random_state=None,
-    do_plot=False,
-):
-    if is_AU2 is None:
-        assert "is_AU2" in out_dict["eval"], "Must provide is_AU2 flag if not present in out_dict"
-        is_AU2 = out_dict["eval"]["is_AU2"]
-    vae_mask = out_dict["eval"].get("vae_mask", vae_mask)
-    iid_mask = out_dict["eval"].get("iid_mask", iid_mask)
-    mc_samples = int(mc_samples)
-    if mc_samples <= 0:
-        mc_samples = 1
-    if (iid_mask is None) and (vae_mask is None):
-        joint_mask = slice(None)
-    elif iid_mask is None:
-        joint_mask = torch.logical_not(vae_mask)
-    elif vae_mask is None:
-        joint_mask = iid_mask
-    else:
-        joint_mask = torch.logical_and(iid_mask, torch.logical_not(vae_mask))
-
-    if is_AU2:
-        eval_mask = iid_mask if iid_mask is not None else slice(None)
-    else:
-        eval_mask = joint_mask
-
-    probs_gts = out_dict["eval"]["probs_gts"].to(torch.float32)
-    ensemble_probs = out_dict["eval"]["probs"].to(torch.float32).mean(dim=0)
-
-    probs_gts_eval = probs_gts[eval_mask]
-    ensemble_probs_eval = ensemble_probs[eval_mask]
-    pred_labels = ensemble_probs_eval.argmax(dim=1)
-
-    idx = torch.arange(probs_gts_eval.shape[0], device=probs_gts_eval.device)
-    fractional_correct = probs_gts_eval[idx, pred_labels]
-
-    if use_monte_carlo:
-        generator = torch.Generator(device=probs_gts_eval.device)
-        if random_state is not None:
-            generator.manual_seed(int(random_state))
-        sampled_labels = torch.multinomial(
-            probs_gts_eval,
-            num_samples=int(mc_samples),
-            replacement=True,
-            generator=generator,
-        )
-        correct_mc = (sampled_labels == pred_labels.unsqueeze(1)).to(torch.float32)
-        correct_values = correct_mc.reshape(-1).cpu().numpy()
-        effective_samples = correct_values.size
-    else:
-        correct_values = fractional_correct.cpu().numpy()
-        effective_samples = correct_values.size
-
-    stats = {}
-    if do_plot:
-        plt.figure(figsize=(12, 4))
-
-    for k, (metric_name, unc_tensor) in enumerate(out_dict["eval"]["unc"].items()):
-        unc_eval = unc_tensor[eval_mask]
-        unc_eval_np = np.asarray(unc_eval, dtype=np.float64).reshape(-1)
-        if use_monte_carlo:
-            unc_fit = np.repeat(unc_eval_np, int(mc_samples))
-        else:
-            unc_fit = unc_eval_np
-
-        a, b = _fit_platt_scaling(unc_fit, correct_values)
-        confidences = _apply_platt_scaling(unc_fit, a, b)
-        ace_val, ece_val, bin_dict = _calibration_bins(confidences, correct_values, n_bins=n_bins)
-
-        stats[metric_name] = {
-            "ace": float(ace_val),
-            "ece": float(ece_val),
-            "a": a,
-            "b": b
-        }
-        if do_plot:
-            plt.subplot(1, 3, k + 1)
-            delta = 1/40
-            y_steps = np.repeat(bin_dict["bin_acc"], 3)
-            x_steps = sum([[i1,i2,float("nan")] for (i1,i2) in zip(bin_dict["bin_conf"]-delta,bin_dict["bin_conf"]+delta)],[])
-            y_steps_ideal = sum([[i,i,float("nan")] for i in bin_dict["bin_conf"]],[])
-
-
-            ratio_use = 1
-            randperm = np.random.permutation(len(confidences))
-            idx = randperm[:int(ratio_use*len(confidences))]
-
-            plt.plot(confidences[idx], correct_values[idx], 'o', alpha=0.1)
-            plt.plot(x_steps, y_steps, 'r-', linewidth=3)
-            plt.plot(x_steps, y_steps_ideal, 'k-', linewidth=2)
-            plt.xlabel("Mapped uncertainty")
-            plt.ylabel("GT prob on predicted class")
-            plt.title(f"{metric_name}\nECE={ece_val:.4f}, ACE={ace_val:.4f}")
-
-    return stats
-
-def calib_stats(out_dict,iid_mask=None,vae_mask=None, do_plot=False, is_AU2=None):
-    """Computes ECE with no temperature scaling, ECE with optimal temperature scaling, 
-    for both NLL and ECE optimal temperatures.
-    """
-    if is_AU2 is None:
-        assert "is_AU2" in out_dict["eval"], "Must provide is_AU2 flag if not present in out_dict"
-        is_AU2 = out_dict["eval"]["is_AU2"]
-    vae_mask = out_dict["eval"].get("vae_mask", vae_mask)
-    iid_mask = out_dict["eval"].get("iid_mask", iid_mask)
-    if (iid_mask is None) and (vae_mask is None):
-        joint_mask = slice(None)
-    elif (iid_mask is None):
-        joint_mask = torch.logical_not(vae_mask)
-    elif (vae_mask is None):
-        joint_mask = iid_mask
-    else:
-        joint_mask = torch.logical_and(iid_mask, torch.logical_not(vae_mask))
-    gts = out_dict["eval"]["probs_gts"].numpy()[joint_mask].argmax(1)
-    Ts = []
-    probs_optece = 0
-    probs_optnll = 0
-    probs = 0
-    for i in range(len(out_dict["eval"]["logits"])):
-        logits = out_dict["eval"]["logits"][i].numpy()
-        T_nll,T_ece = optimize_temp_scaling(logits[joint_mask], gts, do_plot=do_plot)
-        Ts.append((T_nll, T_ece))
-        probs += out_dict["eval"]["probs"][i].numpy()
-        probs_optnll += nn.Softmax(dim=1)(torch.as_tensor(logits / T_nll, dtype=torch.float32)).numpy()
-        probs_optece += nn.Softmax(dim=1)(torch.as_tensor(logits / T_ece, dtype=torch.float32)).numpy()
-    
-    if do_plot:
-        #remove legend
-        plt.subplot(1,2,1)
-        plt.gca().get_legend().remove()
-        plt.tight_layout()
-        plt.show()
-    probs /= len(out_dict["eval"]["logits"])
-    probs_optnll /= len(Ts)
-    probs_optece /= len(Ts)
-    Ts = np.array(Ts)
-    T_optnll = float(np.median(Ts[:,0]))
-    T_optece = float(np.median(Ts[:,1]))
-
-    if is_AU2:
-        #use vae samples
-        if iid_mask is None:
-            eval_mask = slice(None)
-        else:
-            eval_mask = iid_mask
-    else:
-        eval_mask = joint_mask
-
-    gts2 = out_dict["eval"]["probs_gts"].numpy()[eval_mask].argmax(1)
-    probs_gts2 = out_dict["eval"]["probs_gts"].numpy()[eval_mask]
-    probs_optnll2 = probs_optnll[eval_mask]
-    probs_optece2 = probs_optece[eval_mask]
-    probs2 = probs[eval_mask]
-    n2 = len(gts2)
-
-    ece_ = ece(probs2, gts2, n_bins=20)
-    ece_optnll = ece(probs_optnll2, gts2, n_bins=20)
-    ece_optece = ece(probs_optece2, gts2, n_bins=20)
-
-    nll = -np.mean(np.log(probs2[np.arange(n2), gts2] + 1e-12))
-    nll_optnll = -np.mean(np.log(probs_optnll2[np.arange(n2), gts2] + 1e-12))
-    nll_optece = -np.mean(np.log(probs_optece2[np.arange(n2), gts2] + 1e-12))
-
-    ece_optece_eq = ece(probs_optece2, gts2, n_bins=20, equal_bin_weight=True)
-    ece_eq = ece(probs2, gts2, n_bins=20, equal_bin_weight=True)
-    ece_optnll_eq = ece(probs_optnll2, gts2, n_bins=20, equal_bin_weight=True)
-
-    ens_test_acc = probs_gts2[torch.arange(n2),probs2.argmax(1)].mean()
-    ens_test_acc_optece = probs_gts2[torch.arange(n2),probs_optece2.argmax(1)].mean()
-    ens_test_acc_optnll = probs_gts2[torch.arange(n2),probs_optnll2.argmax(1)].mean()
-
-    stats = {
-        "ece": ece_,
-        "ece_optnll": ece_optnll,
-        "ece_optece": ece_optece,
-        "nll": nll,
-        "nll_optnll": nll_optnll,
-        "nll_optece": nll_optece,
-        "T_opt_nll": T_optnll,
-        "T_opt_ece": T_optece,
-        "ece_optece_eq": ece_optece_eq,
-        "ece_eq": ece_eq,
-        "ece_optnll_eq": ece_optnll_eq,
-        "ens_test_acc": ens_test_acc,
-        "ens_test_acc_optece": ens_test_acc_optece,
-        "ens_test_acc_optnll": ens_test_acc_optnll,
-    }
-    stats = {k: float(v) for k, v in stats.items()}
-    return stats
-
-def optimize_temp_scaling(logits, labels, bounds=(0.1, 10.0), n_eval=100, do_plot=False):
-    """Optimize temperature scaling parameter on a validation set.
-    logits: (N,C) array of model logits (pre-softmax)
-    labels: (N,) array of true class labels (integers in [0,C-1])
-    Returns optimal temperature (float).
-    """
-    
-    def nll_loss(temp):
-        scaled_logits = logits / temp
-        exp_logits = np.exp(scaled_logits - np.max(scaled_logits, axis=1, keepdims=True))
-        scaled_probs = exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
-        nll = -np.mean(np.log(scaled_probs[np.arange(len(labels)), labels] + 1e-12))
-        return nll
-
-    temps = np.linspace(bounds[0], bounds[1], n_eval)
-    losses = [nll_loss(t) for t in temps]
-    eces = [ece(torch.as_tensor(logits / t, dtype=torch.float32).softmax(dim=1).numpy(), labels) for t in temps]
-    T_opt_nll = temps[np.argmin(losses)]
-    T_opt_ece = temps[np.argmin(eces)]
-    if do_plot:
-        #plt.figure(figsize=(10,4))
-        plt.subplot(1,2,1)
-        plt.plot(temps, losses, "-")
-        plt.xlabel("Temperature")
-        plt.ylabel("NLL Loss")
-        plt.grid(True)
-        ymin, ymax = plt.ylim()
-        plt.vlines(T_opt_nll, ymin, ymax, colors="blue", linestyles="--", label=f"T_opt_nll: {T_opt_nll:.3f}")
-        plt.vlines(T_opt_ece, ymin, ymax, colors="orange", linestyles="--", label=f"T_opt_ece: {T_opt_ece:.3f}")
-        plt.ylim(ymin, ymax)
-        plt.xlim(bounds[0], bounds[1])
-        plt.legend()
-
-        plt.subplot(1,2,2)
-        plt.plot(temps, eces, "-", color="orange")
-        plt.xlabel("Temperature")
-        plt.ylabel("ECE")
-        plt.grid(True)
-        ymin, ymax = plt.ylim()
-        plt.vlines(T_opt_nll, ymin, ymax, colors="blue", linestyles="--", label=f"T_opt_nll: {T_opt_nll:.3f}")
-        plt.vlines(T_opt_ece, ymin, ymax, colors="orange", linestyles="--", label=f"T_opt_ece: {T_opt_ece:.3f}")
-        plt.ylim(ymin, ymax)
-        plt.xlim(bounds[0], bounds[1])
-        #plt.tight_layout()
-    return T_opt_nll, T_opt_ece
-
-def ambiguity_stats(out_dict, do_plot=False, mask=None, vae_mask=None):
-    """Computes spearmanr for a range of uncertainty measures given probabilistic ground truths.
-    """
-    if mask is None:
-        assert "iid_mask" in out_dict["eval"], "If mask is not provided, out_dict must contain 'iid_mask'"
-        mask = out_dict["eval"]["iid_mask"]
-    if vae_mask is None:
-        assert "vae_mask" in out_dict["eval"], "If vae_mask is not provided, out_dict must contain 'vae_mask'"
-        vae_mask = out_dict["eval"]["vae_mask"]
-    probs_gts = out_dict["eval"]["probs_gts"].numpy()[mask]
-    entropy_gt = -np.sum(probs_gts * np.log(probs_gts + 1e-12), axis=1)
-    is_high_entropy = np.quantile(entropy_gt, 0.9) < entropy_gt
-    amb_stats = {}
-    for k, unc in out_dict["eval"]["unc"].items():
-        unc2 = unc.numpy()[mask]
-        spearman_all = spearmanr(unc2, entropy_gt).correlation
-        spearman_high = spearmanr(unc2[is_high_entropy], entropy_gt[is_high_entropy]).correlation
-        spearman_low = spearmanr(unc2[~is_high_entropy], entropy_gt[~is_high_entropy]).correlation
-        amb_stats[k] = {"spearman_all": spearman_all,
-                       "spearman_high": spearman_high,
-                       "spearman_low": spearman_low,
-                       "ncc_all": np.corrcoef(unc2, entropy_gt)[0,1],
-                       "mean_entropies": {"gt": entropy_gt.mean(),
-                                         "all": unc2.mean(),
-                                         "high": unc2[is_high_entropy].mean(),
-                                         "low": unc2[~is_high_entropy].mean()},
-                                        }
-        
-    # compute that mean abs probability difference between gts and pred
-    # best pred is mean of all models
-    probs_pred = out_dict["eval"]["probs"].numpy()[:,mask].mean(axis=0)
-    vae_mask_mask = vae_mask[mask]
-    amb_stats["mean_prob_diff"] = {"all": np.abs(probs_pred - probs_gts).mean(axis=1).mean(axis=0),
-                                   "vae": np.abs(probs_pred - probs_gts).mean(axis=1)[vae_mask_mask].mean(),
-                                   "non_vae": np.abs(probs_pred - probs_gts).mean(axis=1)[~vae_mask_mask].mean(),}
-
-    if do_plot:
-        #make a bar plot of spearman_all for each uncertainty measure
-        plt.figure(figsize=(8,4))
-        keys = [k for k in amb_stats.keys() if k not in ["mean_entropies", "mean_prob_diff"]]
-        group_keys = ["all", "high", "low"]
-        x = np.arange(3)
-        width = 1/(len(keys)+1)
-        for i, k in enumerate(keys):
-            vals = [amb_stats[k][f"spearman_{group}"] for group in group_keys]
-            plt.bar(x + i*width, vals, width=width, label=k)
-            #mean_entropies written with text on top of bar
-            for j, v in enumerate(vals):
-                value = amb_stats[k]['mean_entropies'][group_keys[j]]
-                plt.text(x[j] + i*width, v + 0.02, f"{short_fmt(value)}", ha='center', va='bottom', fontsize=8)
-        plt.xticks(x + width*(len(keys)-1)/2, group_keys)
-        plt.ylim(-1,1)
-        plt.ylabel("Spearman Correlation")
-        plt.title("Spearman Correlation of Uncertainty vs. GT Entropy")
-        plt.legend()
-        plt.grid(True, axis='y')
-        plt.tight_layout()
-    return amb_stats
-
-def ood_stats(out_dict, do_plot=True, is_ood=None):
-    """Computes AUROC for detecting OOD samples (2,3,5) given uncertainty measures.
-    """
-    if is_ood is None:
-        assert "iid_mask" in out_dict["eval"], "If is_ood is not provided, out_dict must contain 'iid_mask'"
-        is_ood = ~out_dict["eval"]["iid_mask"].numpy()
-    stats_dict = {}
-    n = len(out_dict["eval"]["unc"])
-
-    if do_plot: plt.figure(figsize=(5*n,4))
-
-    for i,(k,v) in enumerate(out_dict["eval"]["unc"].items()):
-        if do_plot: plt.subplot(1,n,i+1)
-        auc, fpr, tpr, thresholds = auroc(v, is_ood, do_plot=do_plot)
-        stats_dict[k] = {"auc": auc, "ood_entropy": v[is_ood].mean(), "iid_entropy": v[~is_ood].mean()}
-        if do_plot: 
-            plt.title(f"{k}, AUROC: {auc:.4f}")
-    return stats_dict
-
-def short_fmt(x):
-    """Format a float in a short way. 3 significant digits,
-    but if <0.01 or >999 use scientific notation. At most 3 decimal places after the comma as well.
-    """
-    if x < 0.01 or x > 999:
-        return f"{x:.1e}"
-    else:
-        if x>1:
-            return f"{x:.3g}"
-        else:
-            return f"{x:.3f}"
-
-def get_seq_models(channels_cnn = [4,8,16,32,64], 
-                   channels_mlp = [32,64,128,256,512],
-                   augs=[0,0.25,0.5,0.75,1],
-                   depths_cnn = [1,2,4,8,16],
-                   depths_mlp = [2,4,8,16,32],
-                   epochs=[10,20,30,40,50]):
-
-    """SETUPS:
-        - Sweeping channel_mult, aug=0
-        - Sweeping channel_mult, aug=1
-        - Sweeping depth, cm=1, augs=0
-        - Sweeping depth, cm=1, augs=1
-        - Sweeeping augs, cm=1, center depth
-    """
-    
-    #"CNN1": lambda: CNNDeluxe(base_channels=cm*16,num_blocks=2,num_downsamples=3)
-    #"MLP1": lambda: MLPDeluxe(tsne=tsne, width=cm*128, num_layers=4)
-
-    base_cnn = {"model": "models.CNNDeluxe", "data_aug": 0, "epochs": 20, "model_args": {"base_channels": 16, "num_blocks": 2, "num_downsamples": 3}}
-    base_mlp = {"model": "models.MLPDeluxe", "data_aug": 0, "epochs": 20, "model_args": {"width": 128, "num_layers": 4}}
-
-    model_cfgs = {}
-    #model_cfgs["CNN_base"] = {}
-    #model_cfgs["MLP_base"] = {}
-    for c in channels_cnn:
-        model_cfgs[f"CNN_c{c}_aug0"] = {"model_args": {"base_channels": c}}
-        model_cfgs[f"CNN_c{c}_aug1"] = {"model_args": {"base_channels": c}, "data_aug": 1}
-    for c in channels_mlp:
-        model_cfgs[f"MLP_c{c}_aug0"] = {"model_args": {"width": c}}
-        model_cfgs[f"MLP_c{c}_aug1"] = {"model_args": {"width": c}, "data_aug": 1}
-    for d in depths_cnn:
-        model_cfgs[f"CNN_d{d}_aug0"] = {"model_args": {"num_blocks": d}}
-        model_cfgs[f"CNN_d{d}_aug1"] = {"model_args": {"num_blocks": d}, "data_aug": 1}
-    for d in depths_mlp:
-        model_cfgs[f"MLP_d{d}_aug0"] = {"model_args": {"num_layers": d}}
-        model_cfgs[f"MLP_d{d}_aug1"] = {"model_args": {"num_layers": d}, "data_aug": 1}
-    for a in augs:
-        model_cfgs[f"CNN_aug{a}"] = {"data_aug": a}
-        model_cfgs[f"MLP_aug{a}"] = {"data_aug": a}
-    for e in epochs:
-        model_cfgs[f"CNN_e{e}"] = {"epochs": e, "model_args": {"base_channels": 32, "num_blocks": 4, "num_downsamples": 4}}
-        model_cfgs[f"MLP_e{e}"] = {"epochs": e, "model_args": {"width": 512, "num_layers": 8}}
-
-    # merge with base configs
-    for k in model_cfgs:
-        if "CNN" in k:
-            model_cfgs[k]["model_args"] = {**base_cnn["model_args"], **model_cfgs[k].get("model_args", {})}
-            model_cfgs[k] = {**base_cnn, **model_cfgs[k]}
-        elif "MLP" in k:
-            model_cfgs[k]["model_args"] = {**base_mlp["model_args"], **model_cfgs[k].get("model_args", {})}
-            model_cfgs[k] = {**base_mlp, **model_cfgs[k]}
-        else:
-            raise ValueError(f"Unknown model type in key {k}")
-    return model_cfgs
-
-def get_aug_models_heavy(augs=[0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1]):
-    """SETUPS:
-        - Sweeping augs for heavy models
-    """
-    base_cnn = {"model": "models.CNNDeluxe", "epochs": 50, "model_args": {"base_channels": 32, "num_blocks": 3, "num_downsamples": 3}}
-    base_mlp = {"model": "models.MLPDeluxe", "epochs": 50, "model_args": {"width": 256, "num_layers": 8}}
-    model_cfgs = {}
-    for a in augs:
-        model_cfgs[f"CNN_aug{a}_H"] = {"data_aug": a}
-        model_cfgs[f"MLP_aug{a}_H"] = {"data_aug": a}
-    # merge with base configs
-    for k in model_cfgs:
-        if "CNN" in k:
-            model_cfgs[k]["model_args"] = {**base_cnn["model_args"], **model_cfgs[k].get("model_args", {})}
-            model_cfgs[k] = {**base_cnn, **model_cfgs[k]}
-        elif "MLP" in k:
-            model_cfgs[k]["model_args"] = {**base_mlp["model_args"], **model_cfgs[k].get("model_args", {})}
-            model_cfgs[k] = {**base_mlp, **model_cfgs[k]}
-        else:
-            raise ValueError(f"Unknown model type in key {k}")
-    return model_cfgs
-
-def get_epochs_models_heavy(epochs=[10,20,30,40,50,60,70,80,90,100]):
-    """SETUPS:
-        - Sweeping epochs for heavy models
-    """
-    base_cnn = {"model": "models.CNNDeluxe", "epochs": 50, "model_args": {"base_channels": 32, "num_blocks": 3, "num_downsamples": 3}}
-    base_mlp = {"model": "models.MLPDeluxe", "epochs": 50, "model_args": {"width": 256, "num_layers": 8}}
-    model_cfgs = {}
-    for e in epochs:
-        model_cfgs[f"CNN_e{e}_H_aug0"] = {"epochs": e}
-        model_cfgs[f"MLP_e{e}_H_aug0"] = {"epochs": e}
-        model_cfgs[f"CNN_e{e}_H_aug1"] = {"epochs": e, "data_aug": 1}
-        model_cfgs[f"MLP_e{e}_H_aug1"] = {"epochs": e, "data_aug": 1}
-    # merge with base configs
-    for k in model_cfgs:
-        if "CNN" in k:
-            model_cfgs[k]["model_args"] = {**base_cnn["model_args"], **model_cfgs[k].get("model_args", {})}
-            model_cfgs[k] = {**base_cnn, **model_cfgs[k]}
-        elif "MLP" in k:
-            model_cfgs[k]["model_args"] = {**base_mlp["model_args"], **model_cfgs[k].get("model_args", {})}
-            model_cfgs[k] = {**base_mlp, **model_cfgs[k]}
-        else:
-            raise ValueError(f"Unknown model type in key {k}")
-    return model_cfgs
-
-def get_heavy_weight_decay_models(epochs=50, weight_decays=[0, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1]):
-    """SETUPS:
-        - Sweeping weight decay for heavy models
-    """
-    base_cnn = {"model": "models.CNNDeluxe", "epochs": epochs, "model_args": {"base_channels": 32, "num_blocks": 3, "num_downsamples": 3}}
-    base_mlp = {"model": "models.MLPDeluxe", "epochs": epochs, "model_args": {"width": 256, "num_layers": 8}}
-    model_cfgs = {}
-    for wd in weight_decays:
-        model_cfgs[f"CNN_wd{wd}_H_aug0"] = {"weight_decay": wd}
-        model_cfgs[f"MLP_wd{wd}_H_aug0"] = {"weight_decay": wd}
-        model_cfgs[f"CNN_wd{wd}_H_aug1"] = {"weight_decay": wd, "data_aug": 1}
-        model_cfgs[f"MLP_wd{wd}_H_aug1"] = {"weight_decay": wd, "data_aug": 1}
-    # merge with base configs
-    for k in model_cfgs:
-        if "CNN" in k:
-            model_cfgs[k]["model_args"] = {**base_cnn["model_args"], **model_cfgs[k].get("model_args", {})}
-            model_cfgs[k] = {**base_cnn, **model_cfgs[k]}
-        elif "MLP" in k:
-            model_cfgs[k]["model_args"] = {**base_mlp["model_args"], **model_cfgs[k].get("model_args", {})}
-            model_cfgs[k] = {**base_mlp, **model_cfgs[k]}
-        else:
-            raise ValueError(f"Unknown model type in key {k}")
-    return model_cfgs
 
 seq_types = {"channels_aug": "[MODEL]_c[CHANNELS]_aug1",
              "channels": "[MODEL]_c[CHANNELS]_aug0",
@@ -1911,6 +1026,8 @@ def seq_type_from_name(name):
     assert "seq_type" in params, f"Could not match sequence type for {name}"
     return params
 
+AU2_EU_setup = {"AU2_EU": {"ignore_digits": [2, 3, 5], "ambiguous_vae_samples": True},}
+
 if __name__=="__main__":
 
     """
@@ -1937,6 +1054,7 @@ if __name__=="__main__":
     argparser.add_argument("--setup", type=int, default=0)
     argparser.add_argument("--augs", type=str, default="")
     argparser.add_argument("--epochs", type=str, default="")
+    argparser.add_argument("--lr_decay", type=str, default="")
     args = argparser.parse_args()
     
     if args.setup==0:
@@ -2069,9 +1187,7 @@ if __name__=="__main__":
         assert len(args.epochs)>0, "Please provide --epochs argument as a comma-separated list of integers, e.g. --epochs 10,20,30"
         epochs = [int(e) for e in args.epochs.split(",")]
         model_setups = get_epochs_models_heavy(epochs=epochs)
-        uncertainty_setups = {
-            "AU2_EU": {"ignore_digits": [2, 3, 5], "ambiguous_vae_samples": True},
-        }
+        uncertainty_setups = AU2_EU_setup
         train_ensembles(model_setups, uncertainty_setups)
     elif args.setup==9:
         print("Training a sequence of HEAVY models where only magnitude of augmentations is varied. EU is the unc setup")
@@ -2085,9 +1201,31 @@ if __name__=="__main__":
     elif args.setup==10:
         print("Training a sequence of HEAVY models where only weight decay and network width is varied. AU2_EU is the unc setup")
         model_setups = get_heavy_weight_decay_models()
+        uncertainty_setups = AU2_EU_setup
+        train_ensembles(model_setups, uncertainty_setups)
+    elif args.setup==11:
+        print("Small test to see if everything works with epoch sweeps and epoch_mode")
+        epoch_list = [1,2,3]
+        model_setups = {
+            "CNN_test_aug0":   {"model": "CNN1", "epochs": epoch_list, "data_aug": 0, "also_save_ema_ckpts": True},
+            "CNN_test_aug0.5": {"model": "CNN1", "epochs": epoch_list, "data_aug": 0.5, "also_save_ema_ckpts": True},
+            "CNN_test_aug1":   {"model": "CNN1", "epochs": epoch_list, "data_aug": 1.0, "also_save_ema_ckpts": True},
+        }
         uncertainty_setups = {
             "AU2_EU": {"ignore_digits": [2, 3, 5], "ambiguous_vae_samples": True},
         }
+        train_ensembles(model_setups, uncertainty_setups)
+    elif args.setup==12:
+        print("Batch size")
+        model_setups = get_batch_size_models_heavy([512])
+        uncertainty_setups = AU2_EU_setup
+        train_ensembles(model_setups, uncertainty_setups)
+    elif args.setup==13:
+        print("epochs+aug")
+        assert args.lr_decay, "Please provide --lr_decay argument as a float, e.g. --lr_decay 0.1"
+        model_setups = get_aug_epoch_models(lr_decay=float(args.lr_decay))
+        model_setups = {k+f"_lrd{args.lr_decay}": v for k,v in model_setups.items()}
+        uncertainty_setups = AU2_EU_setup
         train_ensembles(model_setups, uncertainty_setups)
     else:
         print("Unknown setup:", args.setup)
