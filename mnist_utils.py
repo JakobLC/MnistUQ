@@ -2,6 +2,7 @@ from importlib.resources import files
 from matplotlib import patheffects
 from scipy.interpolate import RegularGridInterpolator
 import random
+import re
 import numpy as np
 from torchvision import datasets, transforms
 from tqdm.auto import tqdm
@@ -465,7 +466,9 @@ def train(
                 if also_save_ema_ckpts:
                     ema_state_dict_clone = {k: v.clone() for k, v in ema_state_dict.items()}
                     history["ema_ckpt_epochs"][epoch] = ema_state_dict_clone
-
+    if also_save_ema_ckpts and not save_ckpt_epoch_flag:
+        history["ema_ckpt_epochs"] = {}
+        history["ema_ckpt_epochs"][epoch] = ema_state_dict_clone
     return history
 
 def get_interp_probs(yb,yb_probs,au_factor):
@@ -734,7 +737,7 @@ def model_from_cfg(m_cfg, as_func=False):
 
 def train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10, 
                     save_dir=os.path.join(ROOT_PATH, "saves"),
-                    skip_existing=True):
+                    skip_existing=True, save_intermediate=False):
     """
     Train ensembles of models across uncertainty and model setups.
 
@@ -759,6 +762,53 @@ def train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10,
     print(f"Total setups: {len(model_setups)}")
     os.makedirs(save_dir, exist_ok=True)
 
+    def _progress_filename(base_fname, progress_count):
+        if not save_intermediate or progress_count >= n_models_per_setup:
+            return base_fname
+        base, ext = os.path.splitext(base_fname)
+        return f"{base}_({progress_count}of{n_models_per_setup}){ext}"
+
+    def _write_snapshot(base_fname, save_obj, progress_count, previous_path=None):
+        target_fname = _progress_filename(base_fname, progress_count)
+        target_path = os.path.join(save_dir, target_fname)
+        tmp_path = target_path + ".tmp"
+        torch.save(save_obj, tmp_path)
+        os.replace(tmp_path, target_path)
+        if previous_path and previous_path != target_path and os.path.exists(previous_path):
+            try:
+                os.remove(previous_path)
+            except FileNotFoundError:
+                pass
+        return target_path
+
+    def _match_standard_progress(prefix, fname):
+        pattern = rf"{re.escape(prefix)}(?:_\((\d+)(?:of)(\d+)\))?\.pth"
+        match = re.fullmatch(pattern, fname)
+        if not match:
+            return None
+        if match.group(1):
+            current = int(match.group(1))
+            total = int(match.group(2))
+            if total != n_models_per_setup:
+                return None
+            return current
+        return n_models_per_setup
+
+    def _match_epoch_progress(prefix, fname):
+        pattern = rf"{re.escape(prefix)}_e(\d+)(_ema)?(?:_\((\d+)(?:of)(\d+)\))?\.pth"
+        match = re.fullmatch(pattern, fname)
+        if not match:
+            return None
+        epoch = int(match.group(1))
+        variant = "ema" if match.group(2) else "normal"
+        if match.group(3):
+            current = int(match.group(3))
+            total = int(match.group(4))
+            if total != n_models_per_setup:
+                return None
+            return epoch, variant, current
+        return epoch, variant, n_models_per_setup
+
 
     # Outer loop: uncertainty setups
     for u_key, u_cfg in uncertainty_setups.items():
@@ -782,13 +832,98 @@ def train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10,
             train_dl_aug, val_dl_aug = get_dataloaders(ignore_digits=u_cfg.get("ignore_digits", []), 
                                                         augment=m_cfg.get("data_aug", False),
                                                         ambiguous_vae_samples=u_cfg.get("ambiguous_vae_samples", 0),
-                                                        batch_size=m_cfg.get("batch_size", 64),)
-
+                                                        batch_size=m_cfg.get("batch_size", 256),)
+            prefix = f"{u_key}__{m_key}"
+            base_fname = f"{prefix}.pth"
             checkpoints = []
             histories = []
             final_acc = []
+            prev_progress_path = None
+            epoch_prev_paths = {}
+            existing_models = 0
 
-            for model_idx in range(n_models_per_setup):
+            if skip_existing:
+                if epoch_mode:
+                    required_keys = [("normal", epoch) for epoch in epoch_list]
+                    if m_cfg.get("also_save_ema_ckpts", False):
+                        required_keys += [("ema", epoch) for epoch in epoch_list]
+
+                    entries = {}
+                    for fname in os.listdir(save_dir):
+                        parsed = _match_epoch_progress(prefix, fname)
+                        if not parsed:
+                            continue
+                        epoch_val, variant, progress = parsed
+                        key = (variant, epoch_val)
+                        entries.setdefault(key, {})[progress] = fname
+
+                    required_present = all(key in entries for key in required_keys)
+                    final_complete = required_present and all(
+                        n_models_per_setup in entries[key] for key in required_keys
+                    )
+                    if final_complete:
+                        print(f"Skipping existing files for {prefix} (all epochs complete)")
+                        continue
+
+                    if save_intermediate and required_present:
+                        partial_sets = []
+                        for key in required_keys:
+                            partial = {p for p in entries[key].keys() if 0 < p < n_models_per_setup}
+                            if not partial:
+                                partial_sets = []
+                                break
+                            partial_sets.append(partial)
+                        common_progress = set.intersection(*partial_sets) if partial_sets else set()
+                        best_progress = max(common_progress) if common_progress else 0
+                        if best_progress > 0:
+                            loaded_epoch_data = {}
+                            for key in required_keys:
+                                fname = entries[key][best_progress]
+                                path = os.path.join(save_dir, fname)
+                                data = torch.load(path, weights_only=False)
+                                loaded_epoch_data[key] = (path, data)
+                                epoch_prev_paths[key] = path
+                            first_data = loaded_epoch_data[required_keys[0]][1]
+                            histories = list(first_data.get("histories", []))
+                            checkpoints = []
+                            final_acc = []
+                            for idx_existing in range(best_progress):
+                                ckpt_entry = {}
+                                acc_entry = {}
+                                for variant, epoch_val in required_keys:
+                                    _, data = loaded_epoch_data[(variant, epoch_val)]
+                                    ckpt_entry.setdefault(variant, {})[epoch_val] = data["checkpoints"][idx_existing]
+                                    acc_entry.setdefault(variant, {})[epoch_val] = data["final_acc"][idx_existing]
+                                checkpoints.append(ckpt_entry)
+                                final_acc.append(acc_entry)
+                            existing_models = len(checkpoints)
+                            print(f"Resuming {prefix} (epoch mode) from {existing_models}/{n_models_per_setup} models")
+                else:
+                    final_path = os.path.join(save_dir, base_fname)
+                    if os.path.isfile(final_path):
+                        print(f"Skipping existing file {final_path}")
+                        continue
+                    if save_intermediate:
+                        best_progress = 0
+                        best_fname = None
+                        for fname in os.listdir(save_dir):
+                            progress = _match_standard_progress(prefix, fname)
+                            if progress is None or progress >= n_models_per_setup:
+                                continue
+                            if progress > best_progress:
+                                best_progress = progress
+                                best_fname = fname
+                        if best_progress > 0 and best_fname:
+                            resume_path = os.path.join(save_dir, best_fname)
+                            resume_data = torch.load(resume_path, weights_only=False)
+                            checkpoints = list(resume_data["checkpoints"])
+                            histories = list(resume_data["histories"])
+                            final_acc = list(resume_data["final_acc"])
+                            existing_models = len(checkpoints)
+                            prev_progress_path = resume_path
+                            print(f"Resuming {prefix} from {existing_models}/{n_models_per_setup} models using {best_fname}")
+
+            for model_idx in range(existing_models, n_models_per_setup):
                 seed = 1234 + model_idx  # deterministic but distinct
                 random.seed(seed)
                 np.random.seed(seed)
@@ -844,10 +979,26 @@ def train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10,
                             test_acc = (test_dl_eval.dataset.probs[torch.arange(len(test_dl_eval.dataset)),test_probs.argmax(axis=1)]).mean()
                             final_acc[-1][ema_or_normal][epoch] = {"train_acc": train_acc.item(), "test_acc": test_acc.item()}
                             print(f"Model {model_idx+1}/{n_models_per_setup} ({u_key}, {m_key}, {ema_or_normal}, epoch {epoch}): Train Acc: {train_acc:.4f}, Test Acc: {test_acc:.4f}")
+                    if save_intermediate and checkpoints:
+                        progress = len(checkpoints)
+                        for ema_or_normal in checkpoints[0].keys():
+                            ema_str = "_ema" if ema_or_normal == "ema" else ""
+                            for epoch in checkpoints[0][ema_or_normal].keys():
+                                save_obj = {
+                                    "checkpoints": [ckpt[ema_or_normal][epoch] for ckpt in checkpoints],
+                                    "histories": histories,
+                                    "final_acc": [fa[ema_or_normal][epoch] for fa in final_acc],
+                                    "uncertainty_setup": u_cfg,
+                                    "model_setup": {**m_cfg, "epochs": epoch},
+                                }
+                                base_fname = f"{u_key}__{m_key}_e{epoch}{ema_str}.pth"
+                                key = (ema_or_normal, epoch)
+                                prev_path = epoch_prev_paths.get(key)
+                                new_path = _write_snapshot(base_fname, save_obj, progress, prev_path)
+                                epoch_prev_paths[key] = new_path
+                                print(f"Saved ensemble results to {new_path}")
                 else:
-                    train_probs, test_probs = model_probs_on_all_points(
-                        model, [train_dl_eval, test_dl_eval],
-                    )
+                    train_probs, test_probs = model_probs_on_all_points(model, [train_dl_eval, test_dl_eval])
                     train_acc = (train_dl_eval.dataset.probs[torch.arange(len(train_dl_eval.dataset)),train_probs.argmax(axis=1)]).mean()
                     test_acc = (test_dl_eval.dataset.probs[torch.arange(len(test_dl_eval.dataset)),test_probs.argmax(axis=1)]).mean()
                     print(f"Model {model_idx+1}/{n_models_per_setup} ({u_key}, {m_key}): Train Acc: {train_acc:.4f}, Test Acc: {test_acc:.4f}")
@@ -856,8 +1007,20 @@ def train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10,
                     checkpoints.append({k: v.cpu() for k, v in model.state_dict().items()})
                     histories.append(history)
                     final_acc.append({"train_acc": train_acc, "test_acc": test_acc})
+
+                    if save_intermediate:
+                        save_obj = {
+                            "checkpoints": checkpoints,
+                            "histories": histories,
+                            "final_acc": final_acc,
+                            "uncertainty_setup": u_cfg,
+                            "model_setup": m_cfg,
+                        }
+                        progress = len(checkpoints)
+                        prev_progress_path = _write_snapshot(f"{u_key}__{m_key}.pth", save_obj, progress, prev_progress_path)
+                        print(f"Saved ensemble results to {prev_progress_path}")
             if epoch_mode:
-                # save a checkpoint by appending e.g. _e10_ema or e_10 to the filename
+                # save a checkpoint by appending e.g. _e10_ema or _e10 to the filename
                 # keep histories dictionaries identical for each save
                 # make sure to replace the epoch key in model setup in addition to a "ema" boolean key
                 for ema_or_normal in checkpoints[0].keys():
@@ -867,7 +1030,7 @@ def train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10,
                             "histories": histories,
                             "final_acc": [fa[ema_or_normal][epoch] for fa in final_acc],  # list[(train_acc, test_acc)]
                             "uncertainty_setup": u_cfg,
-                            "model_setup": m_cfg,
+                            "model_setup": {**m_cfg, "epochs": epoch},
                         }
                         ema_str = "_ema" if ema_or_normal == "ema" else ""
                         fname = f"{u_key}__{m_key}_e{epoch}{ema_str}.pth"
@@ -957,7 +1120,25 @@ def plot_voronoi(out_dict, colorbar=False, title="", cmap="viridis", vmax=1.0, p
         plt.yticks([])
     plt.tight_layout()
 
-seq_types = {"channels_aug": "[MODEL]_c[CHANNELS]_aug1",
+
+seq_type_to_varying_param = {
+    "aug_H": "data_aug",
+    "aug_H_EU": "data_aug",
+    "batch_size_H": "batch_size",
+    "batch_size_H_aug": "batch_size",
+    "channels": "channels",
+    "channels_aug": "channels",
+    "depth": "depth",
+    "depth_aug": "depth",
+    "epochs_H": "epochs",
+    "epochs_H_aug": "epochs",
+    "epochs_lrd_H": "epochs",
+    "epochs_lrd_H_ema": "epochs",
+    "weight_decay_H": "weight_decay",
+    "weight_decay_H_aug": "weight_decay"}
+
+
+"""seq_types = {"channels_aug": "[MODEL]_c[CHANNELS]_aug1",
              "channels": "[MODEL]_c[CHANNELS]_aug0",
              "depth_aug": "[MODEL]_d[DEPTH]_aug1",
              "depth": "[MODEL]_d[DEPTH]_aug0",
@@ -989,9 +1170,9 @@ flags = {"H": "heavy"}
 flags_inv = {"heavy": "H"}
 
 def seq_type_from_name(name):
-    """Returns the sequence type from the model name,
-    in addition to all the key-value pairs found in the name.
-    """
+    #Returns the sequence type from the model name,
+    #in addition to all the key-value pairs found in the name.
+    #
     split_name = name.split("_")
     params = {}
     params["model_type"] = split_name[0]
@@ -1024,7 +1205,7 @@ def seq_type_from_name(name):
             params["seq_type"] = seq_type
             break
     assert "seq_type" in params, f"Could not match sequence type for {name}"
-    return params
+    return params"""
 
 AU2_EU_setup = {"AU2_EU": {"ignore_digits": [2, 3, 5], "ambiguous_vae_samples": True},}
 
@@ -1095,35 +1276,33 @@ if __name__=="__main__":
 
         train_ensembles(model_setups, uncertainty_setups, n_models_per_setup=10)
     elif args.setup==2:
+        from pathlib import Path
         p = os.path.join(ROOT_PATH, "saves")
         print("Calculating uncertainty stats for ensembles in:")
         print(p)
         print("and adding to saved .pth files.")
-        filelist = os.listdir(p)
-        print(f"Found {len(filelist)} files.")
-        filelist2 = []
+        pathlist = list(Path(p).rglob("*.pth"))
+        print(f"Found {len(pathlist)} files.")
+        filelist = []
         print("Filtering for .pth files without unc_stats...")
-        for f in filelist:
-            if f.endswith(".pth"):
-                try:
-                    assert 0
-                    data = torch.load(os.path.join(p, f), weights_only=False)
-                    #data["unc_stats"]["knn_sep"]
-                except:
-                    filelist2.append(f)
-        filelist = filelist2
+        for f in pathlist:
+            try:
+                data = torch.load(str(f), weights_only=False)
+                data["unc_stats"]#["knn_sep"]
+            except:
+                filelist.append(str(f))
         print(f"{len(filelist)} files need processing.")
         bar = tqdm(filelist, desc="Processing models")
-        for filename in filelist:
-            bar.set_description(f"Processing {filename}")
-            data = torch.load(os.path.join(p, filename), weights_only=False)
+        for f in filelist:
+            bar.set_description(f"Processing {f}")
+            data = torch.load(f, weights_only=False)
             unc_dict = uncertainty_stats_from_ckpts(data,
                                                     include_train=False, 
                                                     add_stats=True, 
                                                     tqdm_disable=True
                                                     )
             data["unc_stats"] = unc_dict
-            torch.save(data, os.path.join(p, filename))
+            torch.save(data, f)
             bar.update(1)
         bar.close()
     elif args.setup==3:
@@ -1217,15 +1396,21 @@ if __name__=="__main__":
         train_ensembles(model_setups, uncertainty_setups)
     elif args.setup==12:
         print("Batch size")
-        model_setups = get_batch_size_models_heavy([512])
+        model_setups = get_batch_size_models_heavy()
         uncertainty_setups = AU2_EU_setup
         train_ensembles(model_setups, uncertainty_setups)
     elif args.setup==13:
-        print("epochs+aug")
-        assert args.lr_decay, "Please provide --lr_decay argument as a float, e.g. --lr_decay 0.1"
-        model_setups = get_aug_epoch_models(lr_decay=float(args.lr_decay))
-        model_setups = {k+f"_lrd{args.lr_decay}": v for k,v in model_setups.items()}
+        print("1000 epochs")
+        model_setups = get_aug_epoch_models()
         uncertainty_setups = AU2_EU_setup
         train_ensembles(model_setups, uncertainty_setups)
+    elif args.setup==14:
+        print("Small test to see if everything works with epoch sweeps and epoch_mode")
+        epoch_list = [1,2,4]
+        model_setups = {
+            "CNN_test_aug0":   {"model": "CNN1", "epochs": epoch_list, "data_aug": 0, "also_save_ema_ckpts": True},
+        }
+        uncertainty_setups = AU2_EU_setup
+        train_ensembles(model_setups, uncertainty_setups, skip_existing=True, save_intermediate=True)
     else:
         print("Unknown setup:", args.setup)

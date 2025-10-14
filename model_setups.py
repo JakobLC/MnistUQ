@@ -1,3 +1,4 @@
+import numpy as np
 
 def get_seq_models(channels_cnn = [4,8,16,32,64], 
                    channels_mlp = [32,64,128,256,512],
@@ -156,15 +157,17 @@ def get_batch_size_models_heavy(batch_sizes=[32,64,128,256,512,1024,2048]):
             raise ValueError(f"Unknown model type in key {k}")
     return model_cfgs
 
-def get_aug_epoch_models(augs=[0,0.25,0.5,0.75,1], 
-                         epoch_list=[10,20,30,40,50,60,70,80,90,100,120,140,160,180,200],
-                         lr_decay=1.0):
-    base_cnn = {"model": "models.CNNDeluxe", "epochs": 50, "model_args": {"base_channels": 32, "num_blocks": 3, "num_downsamples": 3}}
-    base_mlp = {"model": "models.MLPDeluxe", "epochs": 50, "model_args": {"width": 256, "num_layers": 8}}
+def get_aug_epoch_models(augs=[0,1], 
+                         epoch_list=np.logspace(1,3,30).astype(int).tolist(),
+                         ):
+    base_cnn = {"model": "models.CNNDeluxe", "epochs": epoch_list, "also_save_ema_ckpts": True, 
+                "model_args": {"base_channels": 32, "num_blocks": 3, "num_downsamples": 3}}
+    base_mlp = {"model": "models.MLPDeluxe", "epochs": epoch_list, "also_save_ema_ckpts": True,
+                "model_args": {"width": 256, "num_layers": 8}}
     model_cfgs = {}
     for a in augs:
-        model_cfgs[f"CNN_aug{a}_H"] = {"data_aug": a, "epochs": epoch_list, "lr_decay": lr_decay, "also_save_ema_ckpts": True}
-        model_cfgs[f"MLP_aug{a}_H"] = {"data_aug": a, "epochs": epoch_list, "lr_decay": lr_decay, "also_save_ema_ckpts": True}
+        model_cfgs[f"CNN_aug{a}_H"] = {"data_aug": a}
+        model_cfgs[f"MLP_aug{a}_H"] = {"data_aug": a}
     # merge with base config
     for k in model_cfgs:
         if "CNN" in k:
@@ -176,3 +179,16 @@ def get_aug_epoch_models(augs=[0,0.25,0.5,0.75,1],
         else:
             raise ValueError(f"Unknown model type in key {k}")
     return model_cfgs
+
+"""
+        print("Small test to see if everything works with epoch sweeps and epoch_mode")
+        epoch_list = [1,2,4]
+        model_setups = {
+            "CNN_test_aug0":   {"model": "CNN1", "epochs": epoch_list, "data_aug": 0, "also_save_ema_ckpts": True},
+        uncertainty_setups = {
+            "AU2_EU": {"ignore_digits": [2, 3, 5], "ambiguous_vae_samples": True},
+        }
+        train_ensembles(model_setups, uncertainty_setups, skip_existing=True, save_intermediate=True)
+
+
+"""
