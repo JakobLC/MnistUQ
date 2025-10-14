@@ -1401,7 +1401,9 @@ if __name__=="__main__":
         train_ensembles(model_setups, uncertainty_setups)
     elif args.setup==13:
         print("1000 epochs")
-        model_setups = get_aug_epoch_models()
+        assert len(args.augs)>0, "Please provide --augs argument as a comma-separated list of floats, e.g. --augs 0,0.1,0.2"
+        augs = [float(a) for a in args.augs.split(",")]
+        model_setups = get_aug_epoch_models(augs=augs)
         uncertainty_setups = AU2_EU_setup
         train_ensembles(model_setups, uncertainty_setups)
     elif args.setup==14:
