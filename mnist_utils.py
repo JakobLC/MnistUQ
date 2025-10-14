@@ -1408,7 +1408,7 @@ if __name__=="__main__":
         print("Small test to see if everything works with epoch sweeps and epoch_mode")
         epoch_list = [1,2,4]
         model_setups = {
-            "CNN_test_aug0":   {"model": "CNN1", "epochs": epoch_list, "data_aug": 0, "also_save_ema_ckpts": True},
+            "CNN_test_aug0":   {"model": "CNN1", "epochs": epoch_list, "data_aug": float(args.augs), "also_save_ema_ckpts": True},
         }
         uncertainty_setups = AU2_EU_setup
         train_ensembles(model_setups, uncertainty_setups, skip_existing=True, save_intermediate=True)
