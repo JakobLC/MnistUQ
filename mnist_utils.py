@@ -1405,7 +1405,7 @@ if __name__=="__main__":
         augs = [float(a) for a in args.augs.split(",")]
         model_setups = get_aug_epoch_models(augs=augs)
         uncertainty_setups = AU2_EU_setup
-        train_ensembles(model_setups, uncertainty_setups)
+        train_ensembles(model_setups, uncertainty_setups, skip_existing=True, save_intermediate=True)
     elif args.setup==14:
         print("Small test to see if everything works with epoch sweeps and epoch_mode")
         epoch_list = [1,2,4]
